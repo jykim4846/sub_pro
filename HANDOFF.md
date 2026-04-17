@@ -123,30 +123,53 @@
 
 수정 파일:
 
-- `.gitignore`
 - `README.md`
-- `g2b_bid_reco/models.py`
-- `g2b_bid_reco/agency_analysis.py`
-- `g2b_bid_reco/notice_prediction.py`
-- `tests/test_agency_analysis.py`
-- `tests/test_notice_prediction.py`
+- `g2b_bid_reco/cli.py`
+- `g2b_bid_reco/csv_import.py`
+- `tests/test_csv_import.py`
 
 핵심 변경 내용:
 
-- `AgencyRangeRequest`에 `reference_date` 추가
-- `AgencyRangeReport`에 `lookback_years_used` 추가
-- 기관 표본이 부족하면 예측 기간을 자동 확장:
-  - `3년 -> 5년 -> 7년`
-- `predict-notice`는 현재 공고의 `opened_at`을 기준일로 넘겨서
-  과거 사례만 사용하고,
-  최근 3년에서 부족하면 5년, 그래도 부족하면 7년으로 넓힘
-- README에도 이 동작을 설명함
-- 테스트 추가/수정 완료
+- `import-contract-csv` CLI 명령 추가
+- 나라장터 다운로드 CSV(`utf-16` + 메타 프리앰블 + 탭 구분)를 직접 적재하는 importer 추가
+- 입력 경로는 파일 / 디렉터리 / glob 패턴 모두 지원
+- `입찰공고번호 + 차수`로 `notice_id` 생성
+- `수요기관 -> agency`, 없으면 `공고기관` fallback
+- `조달업무구분`을 현재 앱 카테고리로 매핑
+  - `공사 -> construction`
+  - `일반용역`, `기술용역 -> service`
+  - `물품(내자)`, `물품(외자) -> goods`
+- `입찰추정가격`과 `계약금액`이 둘 다 있으면 `bid_rate = 계약금액 / 입찰추정가격 * 100`으로 계산해 `bid_results`까지 생성
+- README에 사용법 추가
 
 현재 테스트 상태:
 
 - `python3 -m unittest discover -s tests -t .`
   - 통과
+
+실데이터 smoke test:
+
+```bash
+python3 -m g2b_bid_reco.cli import-contract-csv \
+  --db-path /tmp/g2b_contract_csv_smoke.db \
+  "data/UI-ADOXFA-076R.입찰공고 및 계약내역.csv"
+```
+
+결과 요약:
+
+- CSV 읽은 행 수: `258,499`
+- importer 결과:
+  - `notices_upserted`: `258,499`
+  - `results_upserted`: `176,453`
+  - `contracts_upserted`: `179,481`
+- 최종 DB 실체 row 수:
+  - `bid_notices`: `235,244`
+  - `bid_results`: `155,958`
+  - `contracts`: `179,481`
+
+왜 `notices_upserted`보다 실제 `bid_notices` row 수가 적은가:
+
+- 같은 `입찰공고번호-차수`에 여러 계약 행이 있어 upsert로 합쳐지기 때문
 
 ## Why This Change Was Added
 
@@ -242,18 +265,26 @@ python3 -m g2b_bid_reco.cli agency-range \
 우선순위는 이 순서가 맞다.
 
 1. 로컬 변경분 커밋/푸시
-   - 특히 `3/5/7년 자동 확장` 로직
+   - 특히 `import-contract-csv` importer
 
-2. `service` 공고-낙찰 매핑률 개선
-   - 이게 예측 가능한 기관 수를 더 늘릴 가능성이 큼
+2. 사용자가 연도별 CSV를 계속 내려받을 예정이므로,
+   importer로 실제 `data/*.csv`를 `data/bids.db`에 적재
 
-3. 결과 설명성 강화
-   - 왜 3년이 아니라 5년/7년으로 확장됐는지
-   - 동일 기관 사례가 몇 건이고 peer가 몇 건인지
-   - 더 명확히 보여주기
+3. 적재 후 품질 점검
+   - 예측 가능한 `agency + category + contract_method` 조합 수
+   - `각 수요기관` 같은 저품질 기관명 비율
+   - category별 usable awarded rows
 
-4. 필요하면 이후 기관군 fallback 설계
-   - 단, 사용자 의도상 기간 확장 다음 단계여야 함
+4. 필요하면 저품질 기관명 제외 규칙 추가
+   - 현재는 원본 보존 우선이라 자동 정규화는 넣지 않음
+
+5. 그 다음에야 `service` 매핑률 추가 개선 또는 API 증분 수집 경로 보강 검토
+
+## Current Local State Notes
+
+- `dashboard.py`에 별도 로컬 수정이 있음. 이번 CSV importer 작업과는 별개로 보였고, 커밋에 섞지 않는 편이 안전하다.
+- `data/2024.csv`, `data/2025.csv`, `data/2026.csv`, `data/UI-ADOXFA-076R...csv`, `reports/`는 로컬 데이터 산출물이다. 대용량이므로 기본적으로 Git에는 올리지 않는 편이 맞다.
+- `.DS_Store`도 로컬 잡파일이므로 커밋하지 않는 편이 맞다.
 
 ## Safe Commands
 

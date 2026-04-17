@@ -9,6 +9,7 @@ from pathlib import Path
 from .agency_analysis import AgencyRangeAnalyzer
 from .api import PPSCollector, PublicDataPortalClient, build_collect_query, service_key_from_env
 from .backtest import build_backtest_report, run_batch_backtest
+from .csv_import import import_contract_history_csvs
 from .db import (
     connect,
     get_actual_award,
@@ -92,6 +93,17 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--max-pages", type=int, default=1)
     collect_parser.add_argument("--inqry-div", default="1")
     collect_parser.add_argument("--endpoint")
+
+    import_contract_csv_parser = subparsers.add_parser(
+        "import-contract-csv",
+        help="Import one or more downloaded G2B contract-history CSV files into SQLite.",
+    )
+    import_contract_csv_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    import_contract_csv_parser.add_argument(
+        "paths",
+        nargs="+",
+        help="CSV file(s), directories, or glob patterns to import.",
+    )
 
     enrich_parser = subparsers.add_parser(
         "enrich-stubs",
@@ -232,6 +244,12 @@ def main() -> int:
             max_pages=args.max_pages,
             endpoint_override=args.endpoint,
         )
+        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "import-contract-csv":
+        init_db(args.db_path)
+        result = import_contract_history_csvs(args.db_path, args.paths)
         print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
         return 0
 

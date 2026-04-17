@@ -13,6 +13,7 @@
 ## What It Does
 
 - `collect`: 특정 기간의 공고/낙찰/계약/발주계획 수집
+- `import-contract-csv`: 내려받은 입찰공고/계약내역 CSV를 대량 적재
 - `backfill-recent-3y`: 최근 36개월을 월 단위로 백필
 - `enrich-stubs`: 낙찰만 연결돼 있고 공고 메타가 비어 있는 stub 행을 `bidNtceNo` 개별 조회로 보강
 - `recommend`: 기관/조건을 직접 넣어 추천 투찰률 계산
@@ -57,6 +58,26 @@ python3 -m g2b_bid_reco.cli collect \
   --start 202601010000 \
   --end 202601312359
 ```
+
+다운로드한 계약내역 CSV 대량 적재:
+
+```bash
+python3 -m g2b_bid_reco.cli import-contract-csv \
+  --db-path data/bids.db \
+  "data/UI-ADOXFA-076R.입찰공고 및 계약내역.csv"
+```
+
+여러 연도 파일을 한 번에 넣을 수도 있습니다.
+
+```bash
+python3 -m g2b_bid_reco.cli import-contract-csv \
+  --db-path data/bids.db \
+  data
+```
+
+- `utf-16` + 메타 프리앰블 + 탭 구분 형식의 나라장터 다운로드 CSV를 처리합니다.
+- `입찰공고번호 + 차수`로 `notice_id`를 만들고, `agency_name`/`agency_code`/`contract_method`/`base_amount`/`opened_at`/`contract_amount`를 적재합니다.
+- `계약금액 / 입찰추정가격`으로 `bid_rate`를 계산해 `bid_results`도 함께 채웁니다.
 
 증분 수집 (DB의 마지막 `opened_at` 이후만 받기):
 

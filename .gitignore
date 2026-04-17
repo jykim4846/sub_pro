@@ -1,7 +1,10 @@
 .env
 .env.local
 data/*.db
+data/*.csv
 __pycache__/
 .pytest_cache/
 .omx/
 .omc/
+.DS_Store
+reports/
