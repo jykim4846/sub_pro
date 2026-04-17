@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from math import sqrt
 
 from .models import AgencyRangeReport, AgencyRangeRequest, EvidenceItem, HistoricalBidCase
 
 
 class AgencyRangeAnalyzer:
-    def __init__(self, cases: list[HistoricalBidCase], prior_strength: float = 6.0) -> None:
+    def __init__(
+        self,
+        cases: list[HistoricalBidCase],
+        prior_strength: float = 6.0,
+        lookback_year_candidates: tuple[int, ...] = (3, 5, 7),
+        min_agency_cases_for_stable_window: int = 3,
+    ) -> None:
         self.cases = cases
         self.prior_strength = prior_strength
+        self.lookback_year_candidates = lookback_year_candidates
+        self.min_agency_cases_for_stable_window = min_agency_cases_for_stable_window
 
     def analyze(self, request: AgencyRangeRequest) -> AgencyRangeReport:
-        peer_cases = self._peer_cases(request)
+        peer_cases, lookback_years_used = self._select_peer_cases(request)
         agency_cases = [case for case in peer_cases if case.agency_name == request.agency_name]
 
         if not peer_cases:
@@ -34,6 +43,8 @@ class AgencyRangeAnalyzer:
         half_width = max(blended_spread, min_half_width)
 
         notes: list[str] = []
+        if lookback_years_used is not None:
+            notes.append(f"최근 {lookback_years_used}년 데이터를 기준으로 예측 범위를 계산했습니다.")
         if len(agency_cases) < 3:
             notes.append("기관 자체 표본이 적어 동일 계약방법 peer 그룹 분포를 강하게 반영했습니다.")
         if request.floor_rate is not None and blended_rate < request.floor_rate:
@@ -52,6 +63,7 @@ class AgencyRangeAnalyzer:
             category=request.category,
             contract_method=request.contract_method,
             region=request.region,
+            lookback_years_used=lookback_years_used,
             agency_case_count=len(agency_cases),
             peer_case_count=len(peer_cases),
             blended_rate=round(blended_rate, 3),
@@ -65,7 +77,7 @@ class AgencyRangeAnalyzer:
             evidence=evidence,
         )
 
-    def _peer_cases(self, request: AgencyRangeRequest) -> list[HistoricalBidCase]:
+    def _base_peer_cases(self, request: AgencyRangeRequest) -> list[HistoricalBidCase]:
         peers: list[HistoricalBidCase] = []
         for case in self.cases:
             if case.category != request.category:
@@ -76,6 +88,47 @@ class AgencyRangeAnalyzer:
                 continue
             peers.append(case)
         return peers
+
+    def _select_peer_cases(self, request: AgencyRangeRequest) -> tuple[list[HistoricalBidCase], int | None]:
+        base_peers = self._base_peer_cases(request)
+        if not base_peers:
+            return [], None
+
+        anchor = _parse_opened_at(request.reference_date) or self._latest_case_date(base_peers)
+        if anchor is None:
+            return base_peers, None
+
+        chosen_cases: list[HistoricalBidCase] = []
+        chosen_years: int | None = None
+
+        for years in self.lookback_year_candidates:
+            window_start = anchor - timedelta(days=years * 366)
+            window_cases = []
+            for case in base_peers:
+                case_dt = _parse_opened_at(case.opened_at)
+                if case_dt is None:
+                    continue
+                if window_start <= case_dt <= anchor:
+                    window_cases.append(case)
+
+            if not window_cases:
+                continue
+
+            chosen_cases = window_cases
+            chosen_years = years
+            agency_count = sum(1 for case in window_cases if case.agency_name == request.agency_name)
+            if agency_count >= self.min_agency_cases_for_stable_window:
+                break
+
+        if chosen_cases:
+            return chosen_cases, chosen_years
+        return base_peers, None
+
+    @staticmethod
+    def _latest_case_date(cases: list[HistoricalBidCase]) -> datetime | None:
+        parsed = [_parse_opened_at(case.opened_at) for case in cases]
+        parsed = [item for item in parsed if item is not None]
+        return max(parsed) if parsed else None
 
     @staticmethod
     def _weight_cases(cases: list[HistoricalBidCase], request: AgencyRangeRequest) -> list[tuple[HistoricalBidCase, float]]:
@@ -154,6 +207,7 @@ class AgencyRangeAnalyzer:
             category=request.category,
             contract_method=request.contract_method,
             region=request.region,
+            lookback_years_used=None,
             agency_case_count=0,
             peer_case_count=0,
             blended_rate=round(fallback_rate, 3),
@@ -166,3 +220,20 @@ class AgencyRangeAnalyzer:
             notes=notes,
             evidence=[],
         )
+
+
+def _parse_opened_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    text = value.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y%m%d%H%M", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None

@@ -30,6 +30,7 @@ class NoticePredictionTest(unittest.TestCase):
         report = predictor.predict(notice)
 
         self.assertEqual(report.notice.notice_id, "R25BK000029-000")
+        self.assertEqual(report.analysis.lookback_years_used, 3)
         self.assertGreaterEqual(report.analysis.agency_case_count, 5)
         self.assertGreater(report.analysis.blended_rate, 87.9)
         self.assertIn("현재 공고 자체", report.analysis.notes[0])

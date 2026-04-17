@@ -58,6 +58,7 @@ class AgencyRangeRequest:
     region: str | None = None
     base_amount: float | None = None
     floor_rate: float | None = None
+    reference_date: str | None = None
 
 
 @dataclass
@@ -66,6 +67,7 @@ class AgencyRangeReport:
     category: str
     contract_method: str
     region: str | None
+    lookback_years_used: int | None
     agency_case_count: int
     peer_case_count: int
     blended_rate: float

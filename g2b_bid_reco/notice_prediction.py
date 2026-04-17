@@ -17,6 +17,7 @@ class NoticePredictor:
                 region=notice.region,
                 base_amount=notice.base_amount,
                 floor_rate=notice.floor_rate,
+                reference_date=notice.opened_at,
             )
         )
         analysis.notes.insert(0, "현재 공고 자체는 제외하고 이전 유사 사례만 반영했습니다.")
