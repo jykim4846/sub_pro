@@ -14,9 +14,12 @@
 
 - `collect`: 특정 기간의 공고/낙찰/계약/발주계획 수집
 - `backfill-recent-3y`: 최근 36개월을 월 단위로 백필
+- `enrich-stubs`: 낙찰만 연결돼 있고 공고 메타가 비어 있는 stub 행을 `bidNtceNo` 개별 조회로 보강
 - `recommend`: 기관/조건을 직접 넣어 추천 투찰률 계산
 - `agency-range`: 기관 단위 예측 범위 계산
 - `predict-notice`: 저장된 공고번호 기준으로 과거 유사 사례만 써서 예측
+- `backtest-notice`: 이미 낙찰된 공고 하나를 예측 → 실제 낙찰가와 gap 출력
+- `backtest-batch`: N건 샘플링 → hit rate, 평균 gap, worst case 집계
 
 ## Setup
 
@@ -55,6 +58,19 @@ python3 -m g2b_bid_reco.cli collect \
   --end 202601312359
 ```
 
+증분 수집 (DB의 마지막 `opened_at` 이후만 받기):
+
+```bash
+python3 -m g2b_bid_reco.cli collect-recent \
+  --db-path data/bids.db \
+  --category service \
+  --sources notices,results,contracts
+```
+
+- `--since 20260401` 처럼 직접 지정하면 그 시각 이후만 수집
+- DB가 비어 있으면 `--fallback-days 30`(기본) 만큼 과거를 커버
+- cron/LaunchAgent로 하루 1회 돌리면 사실상 자동 최신 유지
+
 최근 3년 백필:
 
 ```bash
@@ -66,6 +82,34 @@ python3 -m g2b_bid_reco.cli backfill-recent-3y \
   --page-size 100 \
   --max-pages-per-window 20
 ```
+
+여러 카테고리를 순차 보강 (goods + construction 기본):
+
+```bash
+bash scripts/enrich-all-stubs.sh
+# 또는 특정 카테고리만
+bash scripts/enrich-all-stubs.sh service
+# 커스텀 DB / 슬립 시간
+DB_PATH=data/bids.db SLEEP_SEC=1.5 bash scripts/enrich-all-stubs.sh
+```
+
+- 각 카테고리 시작/종료 시점에 stub/usable 건수 출력
+- 중간에 중단해도 `enrich-stubs`가 stub 상태인 행만 다시 집어 resume 가능
+
+Stub notice 보강 (낙찰만 적재되고 공고 메타가 비어 있는 경우):
+
+```bash
+python3 -m g2b_bid_reco.cli enrich-stubs \
+  --db-path data/bids.db \
+  --category service \
+  --batch-limit 200 \
+  --verbose
+```
+
+`backfill-recent-3y`로 results만 들어오고 notices는 백필 기간을 벗어나 있던 공고는
+`agency_name`/`contract_method`/`base_amount`가 비어 있어 예측 대상에서 빠집니다.
+이 명령은 그런 stub 행을 모아 `bidNtceNo`로 notices API를 개별 조회해 메타 데이터만 보강합니다.
+`--batch-limit`을 생략하면 남은 stub을 전부 처리하므로 서비스 호출량에 유의하세요.
 
 기관 조건 기반 추천:
 
@@ -100,11 +144,79 @@ python3 -m g2b_bid_reco.cli predict-notice \
   --notice-id R25BK000029-000
 ```
 
+단일 낙찰 공고 백테스트 (예측 vs 실제):
+
+```bash
+python3 -m g2b_bid_reco.cli backtest-notice \
+  --db-path data/bids.db \
+  --notice-id R25BK000029-000
+```
+
+배치 백테스트 (N건 샘플링 → hit rate 집계):
+
+```bash
+python3 -m g2b_bid_reco.cli backtest-batch \
+  --db-path data/bids.db \
+  --category service \
+  --sample-size 100 \
+  --worst-case-keep 5
+```
+
 테스트:
 
 ```bash
 python3 -m unittest discover -s tests -t .
 ```
+
+## Dashboard
+
+기관 하나를 골라 그 기관의 과거 공고마다 `predict-notice`를 돌려 예측 vs 실제 낙찰가를 시각화합니다.
+
+설치 (한 번만):
+
+```bash
+pip install -e ".[dashboard]"
+```
+
+실행:
+
+```bash
+streamlit run dashboard.py
+```
+
+- 사이드바에서 DB 경로 / 카테고리 / 최소 공고 수 선택
+- 기관 드롭다운에서 대상 기관 선택
+- 꺾은선 차트: 예산(base) / 실제 낙찰가 / 예측 투찰가
+- 마커: ⭐ = "낙찰 가능", ✕ = "낙찰 불가"
+- 하단 테이블에 공고별 세부 비교
+
+낙찰 가능 여부 정의:
+
+- `predicted_amount ≤ actual_amount` 그리고
+- 하한율이 주어지면 `predicted_rate ≥ floor_rate`
+
+## DB Snapshot 공유
+
+`data/*.db`는 Git에서 제외되므로 다른 PC에서 repo만 clone해서는 예측이 동작하지 않습니다.
+갱신 시점의 DB 스냅샷을 GitHub Release 자산으로 업로드하고 다른 PC에서 바로 내려받는 흐름입니다.
+
+스냅샷 발행 (GH 인증이 있는 작업 PC에서):
+
+```bash
+bash scripts/publish-db-snapshot.sh
+```
+
+- 기존 `db-snapshot` 릴리스를 제거하고 동일 태그로 재발행합니다.
+- 자산 URL이 항상 `https://github.com/<owner>/<repo>/releases/download/db-snapshot/bids.db.gz`이므로 다른 PC에서는 URL 고정입니다.
+
+다른 PC에서 복원:
+
+```bash
+bash scripts/pull-db-snapshot.sh
+```
+
+- 기존 `data/bids.db`는 `data/bids.db.bak`으로 백업된 뒤 덮어씁니다.
+- `gh auth login`을 먼저 수행해야 합니다 (repo가 private인 경우 필수).
 
 ## Recommended Workflow
 

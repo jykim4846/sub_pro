@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -10,7 +12,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from .db import connect, upsert_bid_result, upsert_contract, upsert_notice, upsert_procurement_plan
+from .db import (
+    connect,
+    enrich_notice_from_detail,
+    enrich_notice_from_result,
+    stub_notice_ids,
+    upsert_bid_result,
+    upsert_contract,
+    upsert_notice,
+    upsert_procurement_plan,
+)
 
 
 PPS_ENDPOINTS = {
@@ -71,16 +82,36 @@ class BackfillResult:
     total_items_upserted: int
 
 
+@dataclass
+class EnrichStubResult:
+    category: str
+    attempted: int
+    matched: int
+    enriched: int
+    skipped_invalid_id: int
+
+
+RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
 class PublicDataPortalClient:
     def __init__(
         self,
         service_key: str,
         timeout: float = 30.0,
         opener: Callable[[str], str] | None = None,
+        max_retries: int = 8,
+        base_backoff_sec: float = 2.5,
+        per_call_sleep_sec: float = 0.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.service_key = service_key
         self.timeout = timeout
         self.opener = opener or self._default_open
+        self.max_retries = max_retries
+        self.base_backoff_sec = base_backoff_sec
+        self.per_call_sleep_sec = per_call_sleep_sec
+        self.sleep = sleep
 
     def fetch_items(
         self,
@@ -113,8 +144,25 @@ class PublicDataPortalClient:
         merged["serviceKey"] = self.service_key
         query_string = urllib.parse.urlencode(merged, doseq=True)
         url = f"{endpoint}?{query_string}"
-        raw = self.opener(url)
-        return self._parse_payload(raw)
+
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                raw = self.opener(url)
+                if self.per_call_sleep_sec > 0 and attempt == 0:
+                    self.sleep(self.per_call_sleep_sec)
+                return self._parse_payload(raw)
+            except urllib.error.HTTPError as exc:
+                last_exc = exc
+                if exc.code not in RETRYABLE_HTTP_STATUS:
+                    raise
+                self.sleep(self.base_backoff_sec * (2 ** attempt))
+            except urllib.error.URLError as exc:
+                last_exc = exc
+                self.sleep(self.base_backoff_sec * (2 ** attempt))
+
+        assert last_exc is not None
+        raise last_exc
 
     def _default_open(self, url: str) -> str:
         with urllib.request.urlopen(url, timeout=self.timeout) as response:
@@ -196,6 +244,61 @@ class PPSCollector:
             items_upserted=upserted,
         )
 
+    def collect_between(
+        self,
+        category: str,
+        sources: list[str],
+        start: datetime,
+        end: datetime | None = None,
+        page_size: int = 100,
+        max_pages_per_window: int = 20,
+        inqry_div: str = "1",
+    ) -> BackfillResult:
+        windows: list[BackfillWindowResult] = []
+        total_pages_fetched = 0
+        total_items_seen = 0
+        total_items_upserted = 0
+
+        month_pairs = months_between(start=start, end=end)
+        for start_text, end_text in month_pairs:
+            for source in sources:
+                query = build_collect_query(
+                    source=source,
+                    start=start_text,
+                    end=end_text,
+                    page_size=page_size,
+                    inqry_div=inqry_div,
+                )
+                result = self.collect(
+                    source=source,
+                    category=category,
+                    query=query,
+                    max_pages=max_pages_per_window,
+                )
+                windows.append(
+                    BackfillWindowResult(
+                        source=source,
+                        category=category,
+                        start=start_text,
+                        end=end_text,
+                        pages_fetched=result.pages_fetched,
+                        items_seen=result.items_seen,
+                        items_upserted=result.items_upserted,
+                    )
+                )
+                total_pages_fetched += result.pages_fetched
+                total_items_seen += result.items_seen
+                total_items_upserted += result.items_upserted
+
+        return BackfillResult(
+            category=category,
+            months=len(month_pairs),
+            windows=windows,
+            total_pages_fetched=total_pages_fetched,
+            total_items_seen=total_items_seen,
+            total_items_upserted=total_items_upserted,
+        )
+
     def backfill_recent_months(
         self,
         category: str,
@@ -250,6 +353,101 @@ class PPSCollector:
             total_items_upserted=total_items_upserted,
         )
 
+    def enrich_stub_notices(
+        self,
+        category: str,
+        batch_limit: int | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> "EnrichStubResult":
+        endpoint = PPS_ENDPOINTS["notices"][category]
+        with connect(self.db_path) as conn:
+            notice_ids = stub_notice_ids(conn, category=category, limit=batch_limit)
+
+        attempted = 0
+        matched = 0
+        enriched = 0
+        skipped_empty = 0
+
+        for notice_id in notice_ids:
+            attempted += 1
+            bid_ntce_no = _split_notice_number(notice_id)
+            if not bid_ntce_no:
+                skipped_empty += 1
+                continue
+
+            query: dict[str, Any] = {
+                "pageNo": 1,
+                "numOfRows": 5,
+                "inqryDiv": "2",
+                "type": "json",
+                "bidNtceNo": bid_ntce_no,
+            }
+            try:
+                items, _ = self.client.fetch_items(endpoint, query, max_pages=1)
+            except ApiError as exc:
+                if log is not None:
+                    log(f"[enrich-stubs] {notice_id}: api error {exc}")
+                continue
+            except urllib.error.HTTPError as exc:
+                if log is not None:
+                    log(
+                        f"[enrich-stubs] {notice_id}: http {exc.code} after retries; "
+                        f"cooling down 60s before continuing"
+                    )
+                time.sleep(60)
+                continue
+            except urllib.error.URLError as exc:
+                if log is not None:
+                    log(f"[enrich-stubs] {notice_id}: network error {exc}; skipping")
+                continue
+
+            detail = _pick_detail_for_notice(items, notice_id) if items else None
+            if detail is None:
+                continue
+            matched += 1
+
+            with connect(self.db_path) as conn:
+                enrich_notice_from_detail(
+                    conn=conn,
+                    notice_id=notice_id,
+                    agency_name=_first_non_empty(
+                        detail, ["dminsttNm", "ntceInsttNm", "dmndInsttNm", "orderInsttNm"], ""
+                    ),
+                    agency_code=str(_first_non_empty(
+                        detail, ["dminsttCd", "ntceInsttCd", "dmndInsttCd", "orderInsttCd"], ""
+                    ) or ""),
+                    category=category,
+                    contract_method=_first_non_empty(
+                        detail, ["cntrctCnclsMthdNm", "cntrctMthdNm", "bidMethdNm"], ""
+                    ),
+                    region=_first_non_empty(
+                        detail, ["prtcptPsblRgnNm", "rgstTyNm"], ""
+                    ),
+                    base_amount=_to_float(
+                        _first_non_empty(detail, ["presmptPrce", "asignBdgtAmt", "bsisAmt"], 0)
+                    ),
+                    estimated_amount=_to_float(
+                        _first_non_empty(detail, ["asignBdgtAmt", "presmptPrce"], None)
+                    ),
+                    floor_rate=_to_float(
+                        _first_non_empty(detail, ["sucsfbidLwltRate", "lwstLmtRt"], None)
+                    ),
+                    opened_at=_first_non_empty(
+                        detail, ["bidNtceDt", "opengDt", "ntceDt"]
+                    ),
+                )
+            enriched += 1
+            if log is not None and enriched % 100 == 0:
+                log(f"[enrich-stubs] {category}: enriched {enriched}/{attempted}")
+
+        return EnrichStubResult(
+            category=category,
+            attempted=attempted,
+            matched=matched,
+            enriched=enriched,
+            skipped_invalid_id=skipped_empty,
+        )
+
     @staticmethod
     def _ingest_notice(conn, category: str, item: dict[str, Any]) -> bool:
         notice_id = _notice_id(item)
@@ -260,6 +458,7 @@ class PPSCollector:
             conn=conn,
             notice_id=notice_id,
             agency_name=_first_non_empty(item, ["dminsttNm", "ntceInsttNm", "dmndInsttNm", "orderInsttNm"], ""),
+            agency_code=str(_first_non_empty(item, ["dminsttCd", "ntceInsttCd", "dmndInsttCd", "orderInsttCd"], "")),
             category=category,
             contract_method=_first_non_empty(item, ["cntrctMthdNm", "bidMethdNm", "cntrctCnclsMthdNm"], ""),
             region=_first_non_empty(item, ["prtcptPsblRgnNm", "rgstTyNm", "dmndInsttOfclEmailAdrs"], ""),
@@ -276,11 +475,29 @@ class PPSCollector:
         if not notice_id:
             return False
 
+        award_amount = _to_float(_first_non_empty(item, ["sucsfbidAmt", "bidwinnrAmt", "dcsnAmt"], 0)) or 0.0
+        bid_rate = _to_float(_first_non_empty(item, ["sucsfbidRate", "bidwinnrRate", "bidprcRt"], 0)) or 0.0
+
+        agency_from_result = _first_non_empty(item, ["dminsttNm", "ntceInsttNm", "dmndInsttNm"], "") or ""
+        agency_code_from_result = str(_first_non_empty(item, ["dminsttCd", "ntceInsttCd", "dmndInsttCd"], "") or "")
+        opened_at_from_result = _first_non_empty(item, ["rlOpengDt", "fnlSucsfDate", "rgstDt"])
+        derived_base_amount = award_amount / (bid_rate / 100.0) if award_amount > 0 and bid_rate > 0 else None
+
+        enrich_notice_from_result(
+            conn=conn,
+            notice_id=notice_id,
+            category=category,
+            agency_name=agency_from_result,
+            agency_code=agency_code_from_result,
+            base_amount=derived_base_amount,
+            opened_at=opened_at_from_result,
+        )
+
         upsert_bid_result(
             conn=conn,
             notice_id=notice_id,
-            award_amount=_to_float(_first_non_empty(item, ["sucsfbidAmt", "bidwinnrAmt", "dcsnAmt"], 0)),
-            bid_rate=_to_float(_first_non_empty(item, ["sucsfbidRate", "bidwinnrRate", "bidprcRt"], 0)),
+            award_amount=award_amount,
+            bid_rate=bid_rate,
             bidder_count=_to_int(_first_non_empty(item, ["prtcptCnum", "bidprtcptCnt", "opengRankCount"], 0)) or 0,
             winning_company=_first_non_empty(item, ["sucsfbidprsnCmpyNm", "bidwinnrNm", "sucsfbidNm"], ""),
             result_status=_first_non_empty(item, ["opengRsltDivNm", "bidRsltNm"], "awarded"),
@@ -349,6 +566,31 @@ def build_collect_query(
     else:
         raise ValueError(f"Unsupported source: {source}")
     return query
+
+
+def months_between(start: datetime, end: datetime | None = None) -> list[tuple[str, str]]:
+    anchor_end = end or datetime.now()
+    if start > anchor_end:
+        return []
+
+    windows: list[tuple[str, str]] = []
+    year, month = start.year, start.month
+    while (year, month) <= (anchor_end.year, anchor_end.month):
+        last_day = monthrange(year, month)[1]
+        if year == start.year and month == start.month:
+            start_text = start.strftime("%Y%m%d%H%M")
+        else:
+            start_text = f"{year:04d}{month:02d}010000"
+        if year == anchor_end.year and month == anchor_end.month:
+            end_text = anchor_end.strftime("%Y%m%d%H%M")
+        else:
+            end_text = f"{year:04d}{month:02d}{last_day:02d}2359"
+        windows.append((start_text, end_text))
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
+    return windows
 
 
 def month_windows(months: int, end: datetime | None = None) -> list[tuple[str, str]]:
@@ -441,6 +683,32 @@ def _notice_id(item: dict[str, Any]) -> str:
     if not number:
         return ""
     return f"{number}-{str(order).zfill(3)}" if order not in {"", None} and "-" not in str(number) else str(number)
+
+
+def _split_notice_number(notice_id: str) -> str:
+    """Return the bidNtceNo portion of a stored notice_id.
+
+    We store either ``bidNtceNo`` or ``bidNtceNo-bidNtceOrd``. The G2B notices
+    API accepts ``bidNtceNo`` alone, so the order suffix has to be stripped
+    before we pass it back as a query parameter.
+    """
+    if not notice_id:
+        return ""
+    if "-" not in notice_id:
+        return notice_id
+    head, _sep, _tail = notice_id.rpartition("-")
+    return head or notice_id
+
+
+def _pick_detail_for_notice(items: list[dict[str, Any]], notice_id: str) -> dict[str, Any] | None:
+    for item in items:
+        if _notice_id(item) == notice_id:
+            return item
+    bid_ntce_no = _split_notice_number(notice_id)
+    for item in items:
+        if str(item.get("bidNtceNo") or "") == bid_ntce_no:
+            return item
+    return items[0] if items else None
 
 
 def _to_float(value: Any) -> float | None:

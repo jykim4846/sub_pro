@@ -10,17 +10,26 @@ class AgencyRangeAnalyzer:
     def __init__(
         self,
         cases: list[HistoricalBidCase],
-        prior_strength: float = 6.0,
+        prior_strength: float = 4.0,
         lookback_year_candidates: tuple[int, ...] = (3, 5, 7),
         min_agency_cases_for_stable_window: int = 3,
+        peer_base_amount_ratio_range: tuple[float, float] = (0.25, 4.0),
+        outlier_trim_quantile: float = 0.05,
+        same_agency_weight_bonus: float = 2.0,
+        target_win_probability: float = 0.75,
     ) -> None:
         self.cases = cases
         self.prior_strength = prior_strength
         self.lookback_year_candidates = lookback_year_candidates
         self.min_agency_cases_for_stable_window = min_agency_cases_for_stable_window
+        self.peer_base_amount_ratio_range = peer_base_amount_ratio_range
+        self.outlier_trim_quantile = outlier_trim_quantile
+        self.same_agency_weight_bonus = same_agency_weight_bonus
+        self.target_win_probability = max(0.05, min(0.99, target_win_probability))
 
     def analyze(self, request: AgencyRangeRequest) -> AgencyRangeReport:
         peer_cases, lookback_years_used = self._select_peer_cases(request)
+        peer_cases = self._trim_rate_outliers(peer_cases, request.agency_name)
         agency_cases = [case for case in peer_cases if case.agency_name == request.agency_name]
 
         if not peer_cases:
@@ -29,6 +38,11 @@ class AgencyRangeAnalyzer:
         agency_weighted = self._weight_cases(agency_cases, request)
         peer_weighted = self._weight_cases(peer_cases, request)
 
+        quantile = 1.0 - self.target_win_probability
+        agency_rate_target = (
+            self._weighted_quantile(agency_weighted, quantile) if agency_weighted else None
+        )
+        peer_rate_target = self._weighted_quantile(peer_weighted, quantile)
         agency_mean = self._weighted_mean(agency_weighted) if agency_weighted else None
         peer_mean = self._weighted_mean(peer_weighted)
         agency_spread = self._weighted_spread(agency_weighted) if agency_weighted else None
@@ -36,7 +50,8 @@ class AgencyRangeAnalyzer:
 
         agency_strength = sum(weight for _, weight in agency_weighted)
         blend_weight = agency_strength / (agency_strength + self.prior_strength) if agency_strength > 0 else 0.0
-        blended_rate = ((agency_mean or peer_mean) * blend_weight) + (peer_mean * (1.0 - blend_weight))
+        agency_component = agency_rate_target if agency_rate_target is not None else peer_rate_target
+        blended_rate = (agency_component * blend_weight) + (peer_rate_target * (1.0 - blend_weight))
 
         blended_spread = self._blended_spread(agency_spread, peer_spread, blend_weight)
         min_half_width = 0.035 if len(agency_cases) >= 5 else 0.06 if len(agency_cases) >= 3 else 0.09
@@ -58,6 +73,21 @@ class AgencyRangeAnalyzer:
         confidence = self._confidence(len(agency_cases), len(peer_cases))
         evidence = self._build_evidence(agency_weighted, peer_weighted, request.agency_name)
 
+        estimated_win_probability = self._estimate_win_probability(
+            peer_cases=peer_cases,
+            my_rate=blended_rate,
+            floor_rate=request.floor_rate,
+        )
+
+        notes.append(
+            f"목표 낙찰 확률 {self.target_win_probability:.0%} 기준으로 과거 분포의 "
+            f"{(1.0 - self.target_win_probability):.0%} 분위를 중심값으로 선택했습니다."
+        )
+        notes.append(
+            f"이 중심값으로 투찰했다면 과거 유사 사례 기준 낙찰 확률 추정치는 "
+            f"{estimated_win_probability:.0%} 입니다."
+        )
+
         return AgencyRangeReport(
             agency_name=request.agency_name,
             category=request.category,
@@ -73,11 +103,20 @@ class AgencyRangeAnalyzer:
             confidence=confidence,
             agency_mean_rate=round(agency_mean, 3) if agency_mean is not None else None,
             peer_mean_rate=round(peer_mean, 3),
+            target_win_probability=round(self.target_win_probability, 3),
+            estimated_win_probability=estimated_win_probability,
             notes=notes,
             evidence=evidence,
         )
 
     def _base_peer_cases(self, request: AgencyRangeRequest) -> list[HistoricalBidCase]:
+        lo_ratio, hi_ratio = self.peer_base_amount_ratio_range
+        has_ratio_filter = (
+            request.base_amount is not None
+            and request.base_amount > 0
+            and lo_ratio > 0
+            and hi_ratio > lo_ratio
+        )
         peers: list[HistoricalBidCase] = []
         for case in self.cases:
             if case.category != request.category:
@@ -86,6 +125,11 @@ class AgencyRangeAnalyzer:
                 continue
             if request.region and case.region != request.region:
                 continue
+            if has_ratio_filter and case.base_amount > 0:
+                ratio = case.base_amount / request.base_amount
+                # Same-agency cases bypass the scale filter so we never lose a rare direct sample.
+                if case.agency_name != request.agency_name and not (lo_ratio <= ratio <= hi_ratio):
+                    continue
             peers.append(case)
         return peers
 
@@ -124,25 +168,97 @@ class AgencyRangeAnalyzer:
             return chosen_cases, chosen_years
         return base_peers, None
 
+    def _trim_rate_outliers(
+        self,
+        cases: list[HistoricalBidCase],
+        agency_name: str,
+    ) -> list[HistoricalBidCase]:
+        quantile = self.outlier_trim_quantile
+        if quantile <= 0 or len(cases) < 8:
+            return cases
+
+        rates = sorted(case.bid_rate for case in cases)
+        n = len(rates)
+        lo_idx = int(quantile * n)
+        hi_idx = int((1.0 - quantile) * n)
+        if lo_idx >= hi_idx:
+            return cases
+
+        lo = rates[lo_idx]
+        hi = rates[hi_idx - 1]
+        trimmed: list[HistoricalBidCase] = []
+        for case in cases:
+            if case.agency_name == agency_name:
+                trimmed.append(case)
+                continue
+            if lo <= case.bid_rate <= hi:
+                trimmed.append(case)
+        return trimmed
+
     @staticmethod
     def _latest_case_date(cases: list[HistoricalBidCase]) -> datetime | None:
         parsed = [_parse_opened_at(case.opened_at) for case in cases]
         parsed = [item for item in parsed if item is not None]
         return max(parsed) if parsed else None
 
-    @staticmethod
-    def _weight_cases(cases: list[HistoricalBidCase], request: AgencyRangeRequest) -> list[tuple[HistoricalBidCase, float]]:
+    def _weight_cases(
+        self,
+        cases: list[HistoricalBidCase],
+        request: AgencyRangeRequest,
+    ) -> list[tuple[HistoricalBidCase, float]]:
         weighted: list[tuple[HistoricalBidCase, float]] = []
         for case in cases:
             weight = 1.0
+            if case.agency_name == request.agency_name:
+                weight += self.same_agency_weight_bonus
             if request.region and case.region == request.region:
                 weight += 0.5
             if request.base_amount is not None and request.base_amount > 0:
                 gap_ratio = abs(case.base_amount - request.base_amount) / request.base_amount
-                weight += max(0.0, 2.0 - gap_ratio * 4.0)
+                weight += max(0.0, 3.0 - gap_ratio * 6.0)
             weighted.append((case, weight))
         weighted.sort(key=lambda item: item[1], reverse=True)
         return weighted
+
+    @staticmethod
+    def _weighted_quantile(
+        weighted_cases: list[tuple[HistoricalBidCase, float]],
+        quantile: float,
+    ) -> float:
+        if not weighted_cases:
+            return 0.0
+        q = max(0.0, min(1.0, quantile))
+        ordered = sorted(weighted_cases, key=lambda item: item[0].bid_rate)
+        total_weight = sum(weight for _, weight in ordered)
+        if total_weight <= 0:
+            return ordered[len(ordered) // 2][0].bid_rate
+
+        threshold = total_weight * q
+        cumulative = 0.0
+        for case, weight in ordered:
+            cumulative += weight
+            if cumulative >= threshold:
+                return case.bid_rate
+        return ordered[-1][0].bid_rate
+
+    @staticmethod
+    def _estimate_win_probability(
+        peer_cases: list[HistoricalBidCase],
+        my_rate: float,
+        floor_rate: float | None,
+    ) -> float:
+        """Fraction of past awards whose bid_rate is higher than my_rate.
+
+        Under a low-bid auction interpretation, writing `my_rate` would have
+        beaten those higher-rate bidders. If floor_rate is set and my_rate
+        falls below it the bid is disqualified, returning 0.
+        """
+        if not peer_cases:
+            return 0.0
+        if floor_rate is not None and floor_rate > 0 and my_rate < floor_rate:
+            return 0.0
+        higher = sum(1 for case in peer_cases if case.bid_rate > my_rate)
+        return round(higher / len(peer_cases), 4)
 
     @staticmethod
     def _weighted_mean(weighted_cases: list[tuple[HistoricalBidCase, float]]) -> float:

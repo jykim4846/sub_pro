@@ -77,6 +77,8 @@ class AgencyRangeReport:
     confidence: str
     agency_mean_rate: float | None
     peer_mean_rate: float | None
+    target_win_probability: float = 0.0
+    estimated_win_probability: float = 0.0
     notes: list[str] = field(default_factory=list)
     evidence: list[EvidenceItem] = field(default_factory=list)
 
@@ -97,3 +99,56 @@ class BidNoticeSnapshot:
 class NoticePredictionReport:
     notice: BidNoticeSnapshot
     analysis: AgencyRangeReport
+
+
+@dataclass
+class ActualAwardOutcome:
+    notice_id: str
+    award_amount: float
+    bid_rate: float
+    bidder_count: int
+    winning_company: str
+    result_status: str
+
+
+@dataclass
+class BatchBacktestSummary:
+    category: str
+    sample_size: int
+    successful: int
+    skipped_no_peer: int
+    hit_count: int
+    hit_rate: float
+    mean_rate_gap_pp: float | None
+    median_rate_gap_pp: float | None
+    mean_abs_rate_gap_pp: float | None
+    median_abs_rate_gap_pp: float | None
+    mean_abs_amount_gap_ratio: float | None
+    median_abs_amount_gap_ratio: float | None
+    confidence_breakdown: dict[str, int] = field(default_factory=dict)
+    worst_cases: list["BacktestReport"] = field(default_factory=list)
+
+
+@dataclass
+class BacktestReport:
+    notice_id: str
+    agency_name: str
+    category: str
+    contract_method: str
+    region: str
+    base_amount: float
+    predicted_rate: float
+    predicted_lower_rate: float
+    predicted_upper_rate: float
+    predicted_amount: float | None
+    actual_rate: float
+    actual_amount: float
+    rate_gap_pp: float
+    amount_gap: float | None
+    amount_gap_ratio: float | None
+    actual_within_range: bool
+    analysis_confidence: str
+    agency_case_count: int
+    peer_case_count: int
+    lookback_years_used: int | None
+    analysis_notes: list[str] = field(default_factory=list)
