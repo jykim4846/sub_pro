@@ -551,34 +551,201 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
             "agency_cases",
             "peer_cases",
             "detail_url",
-            "search_url",
         ]
     ]
     display.columns = [
         "개찰일", "공고번호", "구분", "기관", "계약방법",
         "예산", "예측투찰가", "예측률(%)", "하한율(%)",
         "추정 낙찰확률", "신뢰도", "기관사례", "peer사례",
-        "나라장터 링크", "검색 폴백",
+        "나라장터 링크",
     ]
 
-    st.dataframe(
+    selection_event = st.dataframe(
         display,
         hide_index=True,
         use_container_width=True,
         height=min(700, 52 + 35 * max(1, len(display))),
+        on_select="rerun",
+        selection_mode="single-row",
+        key="live_notice_table",
         column_config={
             "나라장터 링크": st.column_config.LinkColumn(
                 "나라장터 공고",
                 display_text="🔗 공고 열기",
-                help="나라장터 공고 상세 URL (정확한 taskClCd가 달라 실패할 수 있음 — 그땐 '검색 폴백' 사용)",
-            ),
-            "검색 폴백": st.column_config.LinkColumn(
-                "구글 검색",
-                display_text="🔎 검색",
-                help="공고번호로 구글에서 나라장터 공고 찾기",
+                help="나라장터 공고 상세 URL (taskClCd가 맞지 않으면 열리지 않을 수 있음)",
             ),
         },
     )
+
+    selected_indices = []
+    try:
+        selected_indices = selection_event.selection.rows  # type: ignore[attr-defined]
+    except Exception:
+        selected_indices = []
+
+    if not selected_indices:
+        st.info("위 표에서 공고 행을 클릭하면 해당 기관의 과거 낙찰 추이와 분포가 아래에 펼쳐집니다.")
+        return
+
+    selected_row = df.iloc[int(selected_indices[0])].to_dict()
+    _render_notice_detail(db_path, selected_row)
+
+
+def _render_notice_detail(db_path: str, row: dict) -> None:
+    st.markdown("---")
+    opened = row.get("opened_at")
+    opened_s = opened.strftime("%Y-%m-%d") if hasattr(opened, "strftime") else str(opened)
+    predicted_amount = row.get("predicted_amount") or 0
+    predicted_rate = row.get("predicted_rate")
+    est_win = row.get("estimated_win_probability") or 0
+
+    st.subheader(f"📂 {row['agency_name']} 과거 발주·낙찰")
+    st.caption(
+        f"선택 공고: {row['notice_id']} · 개찰일 {opened_s} · 계약방법 {row['contract_method']} · "
+        f"예산 {row['base_amount']:,.0f}원 · 예측 투찰가 {predicted_amount:,.0f}원 · "
+        f"추정 낙찰확률 {est_win * 100:.0f}%"
+    )
+
+    cutoff = opened.strftime("%Y-%m-%d %H:%M:%S") if hasattr(opened, "strftime") else opened
+    cases = load_historical_cases_for_notice(db_path, row["notice_id"], cutoff)
+    same_agency_all = [c for c in cases if c.agency_name == row["agency_name"]]
+    same_agency = [
+        c for c in same_agency_all if c.contract_method == row["contract_method"]
+    ]
+
+    if not same_agency_all:
+        st.info(
+            "이 기관의 과거 낙찰 사례가 아직 DB에 없습니다. "
+            "그래서 아래 예측은 동일 계약방법의 다른 기관(peer) 분포에서 역산됐습니다."
+        )
+        return
+
+    only_same_method = st.checkbox(
+        f"이 공고와 같은 계약방법(`{row['contract_method']}`)만 보기",
+        value=True,
+        key=f"live_detail_same_method_{row['notice_id']}",
+        help=(
+            "체크 해제하면 이 기관의 모든 계약방법 과거 공고가 포함됩니다. "
+            "계약방법이 다르면 낙찰률 패턴이 달라질 수 있으니 참고용으로만 보세요."
+        ),
+    )
+    shown_cases = same_agency if only_same_method else same_agency_all
+
+    if not shown_cases:
+        st.info("선택한 조건에 해당하는 이 기관의 과거 공고가 없습니다.")
+        return
+
+    avg_rate = sum(c.bid_rate for c in shown_cases) / len(shown_cases)
+    total_award = sum(c.award_amount for c in shown_cases)
+    total_base = sum(c.base_amount for c in shown_cases if c.base_amount)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("과거 공고 수", f"{len(shown_cases)}건")
+    c2.metric("평균 낙찰률", f"{avg_rate:.2f}%")
+    c3.metric("낙찰 총액", f"{total_award:,.0f}원")
+    c4.metric("예가 총액", f"{total_base:,.0f}원")
+
+    st.markdown("#### 📈 이 기관의 과거 발주 · 낙찰 흐름")
+    st.caption(
+        "회색 점선이 **예가(발주 금액)**, 파란 선이 **실제 낙찰가**, 주황 수평선이 이번 공고에서 우리가 추천한 "
+        "**예측 투찰가**입니다. 실제 낙찰가가 예가 아래에 붙는 각도/폭으로 이 기관의 입찰 관행을 볼 수 있습니다."
+    )
+
+    past_df = pd.DataFrame(
+        [
+            {
+                "opened_at": _parse_datetime(c.opened_at),
+                "notice_id": c.notice_id,
+                "contract_method": c.contract_method,
+                "base_amount": c.base_amount,
+                "award_amount": c.award_amount,
+                "bid_rate": c.bid_rate,
+                "bidder_count": c.bidder_count,
+                "winning_company": c.winning_company,
+                "region": c.region,
+            }
+            for c in shown_cases
+        ]
+    ).dropna(subset=["opened_at"]).sort_values("opened_at")
+
+    if past_df.empty:
+        st.info("시간 정보가 있는 과거 공고가 없어 차트를 그릴 수 없습니다.")
+    else:
+        flow_fig = go.Figure()
+        flow_fig.add_trace(
+            go.Scatter(
+                x=past_df["opened_at"],
+                y=past_df["base_amount"],
+                name="예가(발주 금액)",
+                mode="lines+markers",
+                line=dict(color="#9aa0a6", dash="dot"),
+                hovertemplate="%{x|%Y-%m-%d}<br>예가 %{y:,.0f}원<br>%{customdata}",
+                customdata=past_df["notice_id"],
+            )
+        )
+        flow_fig.add_trace(
+            go.Scatter(
+                x=past_df["opened_at"],
+                y=past_df["award_amount"],
+                name="실제 낙찰가",
+                mode="lines+markers",
+                line=dict(color="#1f77b4"),
+                hovertemplate="%{x|%Y-%m-%d}<br>낙찰가 %{y:,.0f}원<br>%{customdata}",
+                customdata=past_df["notice_id"],
+            )
+        )
+        if predicted_amount:
+            flow_fig.add_hline(
+                y=float(predicted_amount),
+                line_dash="dash",
+                line_color="#ff7f0e",
+                annotation_text=(
+                    f"🎯 이 공고 예측 투찰가 {float(predicted_amount):,.0f}원 "
+                    f"({float(predicted_rate):.2f}%)" if predicted_rate else f"🎯 예측 {float(predicted_amount):,.0f}원"
+                ),
+                annotation_position="top left",
+                annotation_font_color="#ff7f0e",
+            )
+        flow_fig.update_layout(
+            xaxis_title="개찰일",
+            yaxis_title="금액 (원)",
+            hovermode="x unified",
+            height=420,
+            margin=dict(l=20, r=10, t=20, b=30),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        flow_fig.update_yaxes(tickformat=",")
+        st.plotly_chart(flow_fig, use_container_width=True)
+
+    st.markdown("#### 📋 공고 상세 목록 (최신순)")
+    table_df = past_df.sort_values("opened_at", ascending=False).copy()
+    table_df["개찰일"] = table_df["opened_at"].dt.strftime("%Y-%m-%d")
+    table_df["예가"] = table_df["base_amount"].map(_format_amount)
+    table_df["낙찰가"] = table_df["award_amount"].map(_format_amount)
+    table_df["낙찰률(%)"] = table_df["bid_rate"].map(_format_rate)
+    table_df["참가자"] = table_df["bidder_count"]
+    table_df = table_df[
+        [
+            "개찰일", "notice_id", "contract_method", "region",
+            "예가", "낙찰가", "낙찰률(%)", "참가자", "winning_company",
+        ]
+    ]
+    table_df.columns = [
+        "개찰일", "공고번호", "계약방법", "지역",
+        "예가", "낙찰가", "낙찰률(%)", "참가자", "낙찰 기업",
+    ]
+    st.dataframe(
+        table_df,
+        hide_index=True,
+        use_container_width=True,
+        height=min(500, 52 + 35 * max(1, len(table_df))),
+    )
+
+
+def _parse_datetime(value):
+    try:
+        return pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return None
 
 
 def main() -> None:

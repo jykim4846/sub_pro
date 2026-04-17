@@ -282,7 +282,6 @@ python3 -m g2b_bid_reco.cli agency-range \
 
 ## Current Local State Notes
 
-- `dashboard.py`에 별도 로컬 수정이 있음. 이번 CSV importer 작업과는 별개로 보였고, 커밋에 섞지 않는 편이 안전하다.
 - `data/2024.csv`, `data/2025.csv`, `data/2026.csv`, `data/UI-ADOXFA-076R...csv`, `reports/`는 로컬 데이터 산출물이다. 대용량이므로 기본적으로 Git에는 올리지 않는 편이 맞다.
 - `.DS_Store`도 로컬 잡파일이므로 커밋하지 않는 편이 맞다.
 
@@ -341,14 +340,5 @@ python3 -m g2b_bid_reco.cli agency-range \
 
 ## Current Working Tree
 
-현재 Git working tree에는 미커밋 변경이 있다.
-
-- `.gitignore`
-- `README.md`
-- `g2b_bid_reco/models.py`
-- `g2b_bid_reco/agency_analysis.py`
-- `g2b_bid_reco/notice_prediction.py`
-- `tests/test_agency_analysis.py`
-- `tests/test_notice_prediction.py`
-
-이 변경은 의도된 작업 중 상태다. 실수로 되돌리지 말 것.
+- 마지막 확인 시점 기준으로 `dashboard.py`를 제외한 주요 importer/handoff 변경은 원격 `main`에 반영돼 있었다.
+- 후속 작업 전에는 `git status`로 실제 로컬 상태를 다시 확인하는 편이 안전하다.
