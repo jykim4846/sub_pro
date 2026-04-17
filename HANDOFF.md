@@ -286,6 +286,32 @@ python3 -m g2b_bid_reco.cli agency-range \
 - `data/2024.csv`, `data/2025.csv`, `data/2026.csv`, `data/UI-ADOXFA-076R...csv`, `reports/`는 로컬 데이터 산출물이다. 대용량이므로 기본적으로 Git에는 올리지 않는 편이 맞다.
 - `.DS_Store`도 로컬 잡파일이므로 커밋하지 않는 편이 맞다.
 
+## Release Assets For Another Machine
+
+연도별 CSV는 GitHub Release asset으로 올렸다.
+
+- release tag: `csv-history-20260417`
+- URL: `https://github.com/jykim4846/sub_pro/releases/tag/csv-history-20260417`
+
+포함 파일:
+
+- `2024.csv`
+- `2025.csv`
+- `2026.csv`
+
+다른 PC에서 내려받은 뒤 적재:
+
+```bash
+python3 -m g2b_bid_reco.cli import-contract-csv \
+  --db-path data/bids.db \
+  data
+```
+
+주의:
+
+- CSV는 Git repo에는 포함되지 않는다.
+- 다음 AI는 release asset을 먼저 내려받고 importer를 돌리는 흐름으로 시작하면 된다.
+
 ## Safe Commands
 
 테스트:
