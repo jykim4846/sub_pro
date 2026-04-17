@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -19,11 +20,34 @@ import streamlit as st
 from g2b_bid_reco.agency_analysis import AgencyRangeAnalyzer
 from g2b_bid_reco.backtest import build_backtest_report
 from g2b_bid_reco.db import (
+    add_suggestion,
+    auto_generate_suggestions,
+    compute_weekly_metrics,
+    connect,
+    delete_mock_bid,
+    get_actual_award,
+    get_notice_snapshot,
     list_agencies_with_backtestable_notices,
+    list_agency_parent_mappings,
+    list_metrics_snapshots,
+    list_mock_bids,
+    list_simulation_ids,
+    list_suggestions,
     load_backtestable_notices_for_agency,
+    load_cases_for_agencies,
     load_historical_cases_for_notice,
     load_pending_notices_for_prediction,
+    resolve_adaptive_agencies,
+    revenue_summary,
+    save_mock_bid,
+    save_mock_bid_batch,
+    seed_agency_parent_mapping,
+    take_weekly_snapshot,
+    top_winners_for_scope,
+    update_agency_parent_status,
+    update_suggestion,
 )
+from g2b_bid_reco.simulation import CompetitorSpec, run_simulation
 from g2b_bid_reco.models import ActualAwardOutcome, BidNoticeSnapshot
 from g2b_bid_reco.notice_prediction import NoticePredictor
 
@@ -101,10 +125,51 @@ def _run_prediction(
     actual: ActualAwardOutcome,
     target_win_probability: float,
 ):
-    cases = load_historical_cases_for_notice(db_path, notice.notice_id, notice.opened_at)
+    cases, parent_used = _load_cases_adaptive(
+        db_path, notice.notice_id, notice.agency_name, notice.category,
+        notice.contract_method, notice.opened_at,
+    )
     analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
     prediction = NoticePredictor(analyzer).predict(notice)
+    if parent_used:
+        prediction.analysis.notes.append(
+            f"sparse-agency fallback: 부모 '{parent_used}'로 확장된 풀로 예측했습니다."
+        )
     return prediction, build_backtest_report(prediction, actual)
+
+
+def _load_cases_adaptive(
+    db_path: str,
+    notice_id: str,
+    agency_name: str,
+    category: str,
+    contract_method: str,
+    opened_at,
+):
+    agency_list, parent_used = resolve_adaptive_agencies(
+        db_path, agency_name, category=category, contract_method=contract_method,
+    )
+    if parent_used:
+        cases = load_cases_for_agencies(
+            db_path, agency_list,
+            category=category, contract_method=contract_method,
+            cutoff_opened_at=opened_at, exclude_notice_id=notice_id,
+        )
+        # Fallback: expand to full category+method peer pool for non-agency peers.
+        peer = load_historical_cases_for_notice(
+            db_path, notice_id, opened_at, category=category, contract_method=contract_method,
+        )
+        # Merge: include both (dedupe by notice_id)
+        seen = {c.notice_id for c in cases}
+        for c in peer:
+            if c.notice_id not in seen:
+                cases.append(c)
+        return cases, parent_used
+    cases = load_historical_cases_for_notice(
+        db_path, notice_id, opened_at,
+        category=category, contract_method=contract_method,
+    )
+    return cases, None
 
 
 def _win_possible(report, floor_rate: float | None) -> bool:
@@ -124,7 +189,7 @@ def _load_rows_for_agency(
     category: str | None,
     target_win_probability: float,
 ) -> pd.DataFrame:
-    pairs = load_backtestable_notices_for_agency(db_path, agency_name, category=category)
+    pairs = load_backtestable_notices_for_agency(db_path, agency_name, category=category, limit=100)
     rows: list[dict] = []
     for notice, actual in pairs:
         try:
@@ -401,9 +466,16 @@ def _load_pending_rows(
     rows: list[dict] = []
     for notice in notices:
         try:
-            cases = load_historical_cases_for_notice(db_path, notice.notice_id, notice.opened_at)
+            cases, parent_used = _load_cases_adaptive(
+                db_path, notice.notice_id, notice.agency_name, notice.category,
+                notice.contract_method, notice.opened_at,
+            )
             analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
             prediction = NoticePredictor(analyzer).predict(notice)
+            if parent_used:
+                prediction.analysis.notes.append(
+                    f"sparse-agency fallback: 부모 '{parent_used}'로 확장된 풀로 예측했습니다."
+                )
             analysis = prediction.analysis
             predicted_amount = analysis.recommended_amount
             predicted_rate = analysis.blended_rate
@@ -476,11 +548,12 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         with c3:
             limit = st.number_input(
                 "최대 표시 건수",
-                min_value=20,
+                min_value=10,
                 max_value=1000,
-                value=200,
-                step=20,
+                value=30,
+                step=10,
                 key="live_limit",
+                help="너무 큰 값은 예측 계산 시간이 오래 걸립니다. 처음엔 30~50 권장.",
             )
 
         agency_filter = st.text_input(
@@ -490,6 +563,16 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         )
 
     category = dict(CATEGORY_DROPDOWN)[category_label]
+
+    run_key = (category_label, int(since_days), int(limit), agency_filter.strip(), target_win_probability)
+    if st.session_state.get("live_last_run_key") != run_key:
+        if not st.button("🔮 예측 계산 실행", key="live_run_btn"):
+            st.info(
+                "Live 예측은 공고마다 과거 이력을 스캔해서 시간이 걸립니다. "
+                "위 조건을 확인한 뒤 버튼을 눌러 계산을 시작하세요."
+            )
+            return
+        st.session_state["live_last_run_key"] = run_key
 
     df = _load_pending_rows(
         db_path=db_path,
@@ -607,7 +690,9 @@ def _render_notice_detail(db_path: str, row: dict) -> None:
     )
 
     cutoff = opened.strftime("%Y-%m-%d %H:%M:%S") if hasattr(opened, "strftime") else opened
-    cases = load_historical_cases_for_notice(db_path, row["notice_id"], cutoff)
+    cases = load_historical_cases_for_notice(
+        db_path, row["notice_id"], cutoff, agency_name=row["agency_name"]
+    )
     same_agency_all = [c for c in cases if c.agency_name == row["agency_name"]]
     same_agency = [
         c for c in same_agency_all if c.contract_method == row["contract_method"]
@@ -748,20 +833,651 @@ def _parse_datetime(value):
         return None
 
 
+def _render_review_tab(db_path: str, fee_rate: float) -> None:
+    st.subheader("주간 리뷰 & 개선 제안 슬랏")
+    st.caption(
+        "주간 KPI 스냅샷으로 측정-기반 진화를 유지합니다. 버튼으로 스냅샷을 찍으면 "
+        "자동 룰 엔진이 감지한 개선 포인트가 바로 '개선 제안'에 올라오고, 사람이 검토/승인/구현 상태를 관리합니다."
+    )
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([2, 2, 3])
+        with c1:
+            if st.button("📸 이번 주 스냅샷 생성", type="primary"):
+                take_weekly_snapshot(db_path, fee_rate=fee_rate)
+                created = auto_generate_suggestions(db_path)
+                st.success(
+                    f"스냅샷 저장 완료. 자동 제안 {len(created)}건 추가."
+                )
+                st.rerun()
+        with c2:
+            if st.button("🧠 지금 자동 제안만 재점검"):
+                created = auto_generate_suggestions(db_path)
+                st.info(f"자동 제안 {len(created)}건 추가")
+                st.rerun()
+        with c3:
+            st.caption(
+                "수수료율은 사이드바의 '목표 낙찰 확률'과 별개로 '모의 입찰' 탭에서 설정한 값이 "
+                "스냅샷에 함께 기록됩니다. 현재 리뷰에서 사용 중인 수수료: "
+                f"**{fee_rate * 100:.3f}%**"
+            )
+
+    snaps = list_metrics_snapshots(db_path, limit=12)
+    if not snaps:
+        st.info("아직 스냅샷이 없습니다. 위 버튼으로 첫 스냅샷을 만드세요.")
+    else:
+        cur = snaps[0]
+        prev = snaps[1] if len(snaps) >= 2 else None
+
+        def fmt_num(v):
+            return f"{int(v):,}" if v is not None else "–"
+
+        def fmt_money(v):
+            return f"{float(v):,.0f}" if v is not None else "–"
+
+        def fmt_pct(v):
+            return f"{(v or 0) * 100:.1f}%"
+
+        def delta(v, pv):
+            if pv is None or v is None:
+                return None
+            if isinstance(v, (int, float)) and isinstance(pv, (int, float)):
+                return v - pv
+            return None
+
+        def indicator(v, pv, good_is_up: bool = True):
+            d = delta(v, pv)
+            if d is None:
+                return ""
+            if d == 0:
+                return "—"
+            up = d > 0
+            good = up if good_is_up else (not up)
+            return ("🟢" if good else "🔴") + (" ▲" if up else " ▼") + f" {d:+,.2f}"
+
+        st.markdown(f"##### 🗓 최근 스냅샷: **{cur['snapshot_date']}**"
+                     + (f"  ·  직전: {prev['snapshot_date']}" if prev else ""))
+        r1 = st.columns(4)
+        r1[0].metric("Notices(total)", fmt_num(cur["notices_total"]),
+                       indicator(cur["notices_total"], prev["notices_total"] if prev else None))
+        r1[1].metric("Notices(new 7d)", fmt_num(cur["notices_new_7d"]),
+                       indicator(cur["notices_new_7d"], prev["notices_new_7d"] if prev else None))
+        r1[2].metric("Approved mappings", fmt_num(cur["approved_mappings"]),
+                       indicator(cur["approved_mappings"], prev["approved_mappings"] if prev else None))
+        r1[3].metric("Pending mappings", fmt_num(cur["pending_mappings"]),
+                       indicator(cur["pending_mappings"], prev["pending_mappings"] if prev else None,
+                                 good_is_up=False))
+        r2 = st.columns(4)
+        r2[0].metric("Mock wins", fmt_num(cur["mock_wins"]),
+                       indicator(cur["mock_wins"], prev["mock_wins"] if prev else None))
+        r2[1].metric("Win rate", fmt_pct(cur["win_rate"]),
+                       indicator(cur["win_rate"], prev["win_rate"] if prev else None))
+        r2[2].metric("Revenue 7d", fmt_money(cur["revenue_7d"]),
+                       indicator(cur["revenue_7d"], prev["revenue_7d"] if prev else None))
+        r2[3].metric("Revenue total", fmt_money(cur["revenue_total"]),
+                       indicator(cur["revenue_total"], prev["revenue_total"] if prev else None))
+
+        with st.expander("📜 과거 스냅샷 전체"):
+            df = pd.DataFrame(snaps)
+            st.dataframe(df, hide_index=True, use_container_width=True)
+
+    st.markdown("### 💡 다음 개선 제안 슬랏")
+    impact_order = {"high": 0, "medium": 1, "low": 2}
+    pending = sorted(
+        list_suggestions(db_path, status="proposed"),
+        key=lambda s: (impact_order.get(s["impact"], 3), s["updated_at"]),
+    )
+    top3 = pending[:3]
+    if top3:
+        for s in top3:
+            with st.container(border=True):
+                st.markdown(f"**[{s['impact'].upper()}] {s['title']}**   <small>#{s['suggestion_id']} · {s['source']}</small>",
+                              unsafe_allow_html=True)
+                if s["description"]:
+                    st.write(s["description"])
+                if s["rationale"]:
+                    st.caption(f"근거: {s['rationale']}")
+                b1, b2, b3 = st.columns([1, 1, 6])
+                with b1:
+                    if st.button("✅ 승인", key=f"ap_{s['suggestion_id']}"):
+                        update_suggestion(db_path, s["suggestion_id"], status="approved")
+                        st.rerun()
+                with b2:
+                    if st.button("🚫 보류", key=f"rj_{s['suggestion_id']}"):
+                        update_suggestion(db_path, s["suggestion_id"], status="rejected")
+                        st.rerun()
+    else:
+        st.info("현재 올라와 있는 제안이 없습니다. 스냅샷을 찍거나 아래에서 수동으로 추가하세요.")
+
+    with st.expander("➕ 새 제안 수동 추가"):
+        t = st.text_input("제목", key="sg_title")
+        d = st.text_area("설명", key="sg_desc")
+        r = st.text_area("근거 (지표/관측)", key="sg_rationale")
+        imp = st.selectbox("예상 임팩트", ["high", "medium", "low"], index=1, key="sg_impact")
+        if st.button("등록", key="sg_add"):
+            if not t.strip():
+                st.error("제목은 필수입니다.")
+            else:
+                sid = add_suggestion(db_path, t.strip(), d.strip(), r.strip(), imp, source="manual")
+                st.success(f"제안 #{sid} 등록")
+                st.rerun()
+
+    st.markdown("### 📋 모든 제안 (status 별)")
+    all_suggestions = list_suggestions(db_path)
+    if not all_suggestions:
+        st.info("등록된 제안이 없습니다.")
+        return
+    df = pd.DataFrame(all_suggestions)
+    st.dataframe(
+        df[["suggestion_id", "status", "impact", "title", "rationale",
+             "source", "updated_at", "note"]],
+        hide_index=True, use_container_width=True,
+        height=min(500, 52 + 35 * max(1, len(df))),
+    )
+    with st.expander("✏️ 상태/메모 업데이트"):
+        ids = [int(x) for x in df["suggestion_id"].tolist()]
+        target = st.selectbox("대상 suggestion_id", ["(선택)"] + ids, key="sg_update_pick")
+        new_status = st.selectbox(
+            "새 상태", ["(변경 없음)", "proposed", "approved", "implemented", "rejected"],
+            index=0, key="sg_update_status",
+        )
+        new_note = st.text_input("메모", key="sg_update_note")
+        if st.button("적용", key="sg_update_apply") and target != "(선택)":
+            update_suggestion(
+                db_path, int(target),
+                status=None if new_status == "(변경 없음)" else new_status,
+                note=new_note or None,
+            )
+            st.success("업데이트 적용")
+            st.rerun()
+
+
+def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
+    st.subheader("자동 모의 입찰 (Monte Carlo 배치)")
+    st.caption(
+        "진행 중 공고에 대해 1) 내 고객 1~10명이 분산 전략으로 투찰, 2) 해당 scope의 과거 반복 낙찰 top-10 업체가 "
+        "각자 과거 투찰률 분포에서 샘플링해 경쟁한다고 가정. N회 시뮬레이션으로 승률을 측정하고, "
+        "고객 투찰 내역을 DB에 저장해 이후 실제 결과 도착 시 수익(수수료) 합계까지 자동 집계합니다."
+    )
+
+    with st.container(border=True):
+        st.markdown("### ▶️ 시뮬레이션 실행")
+        r1 = st.columns(4)
+        with r1[0]:
+            category_label = st.selectbox(
+                "구분", [label for label, _ in CATEGORY_DROPDOWN], index=0, key="sim_category",
+            )
+        with r1[1]:
+            since_days = st.number_input("최근 N일", min_value=1, max_value=365,
+                                          value=14, step=1, key="sim_since_days")
+        with r1[2]:
+            max_notices = st.number_input("최대 공고 수", min_value=5, max_value=200,
+                                            value=30, step=5, key="sim_max_notices")
+        with r1[3]:
+            agency_filter = st.text_input("기관 (선택, 정확 일치)", key="sim_agency")
+
+        r2 = st.columns(4)
+        with r2[0]:
+            num_customers = st.slider("내 고객 수", 1, 10, 5, key="sim_num_customers")
+        with r2[1]:
+            num_competitors = st.slider("경쟁사 수 (top-K)", 1, 15, 10, key="sim_num_competitors")
+        with r2[2]:
+            num_runs = st.slider("시뮬레이션 횟수", 100, 2000, 300, step=100, key="sim_num_runs")
+        with r2[3]:
+            fee_pct = st.number_input("수수료 %", min_value=0.0, max_value=5.0,
+                                       value=0.05, step=0.01, format="%.2f", key="sim_fee_pct",
+                                       help="낙찰가 대비 내 수수료. 기본 0.05%.")
+
+        persist = st.checkbox("결과를 DB에 저장(실제 결과 반영 시 수익 집계 가능)",
+                                value=True, key="sim_persist")
+        run_btn = st.button("🎲 배치 시뮬레이션 실행", key="sim_run_btn", type="primary")
+
+    category = dict(CATEGORY_DROPDOWN)[category_label]
+    fee_rate = float(fee_pct) / 100.0
+
+    if run_btn:
+        with st.spinner("공고 수집 중..."):
+            notices = load_pending_notices_for_prediction(
+                db_path=db_path, category=category,
+                agency_name=agency_filter.strip() or None,
+                since_days=int(since_days), limit=int(max_notices),
+            )
+        if not notices:
+            st.warning("조건에 맞는 진행 중 공고가 없습니다.")
+        else:
+            reports = []
+            batch_rows: list[dict] = []
+            simulation_id = f"sim-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+            progress = st.progress(0.0, text=f"0/{len(notices)} 처리 중...")
+            for i, notice in enumerate(notices):
+                try:
+                    cases, parent_used = _load_cases_adaptive(
+                        db_path, notice.notice_id, notice.agency_name,
+                        notice.category, notice.contract_method, notice.opened_at,
+                    )
+                    analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
+                    prediction = NoticePredictor(analyzer).predict(notice)
+                    analysis = prediction.analysis
+                    winners = top_winners_for_scope(
+                        db_path, notice.agency_name, notice.category, notice.contract_method,
+                        limit=int(num_competitors), base_amount=notice.base_amount,
+                    )
+                    comps = [
+                        CompetitorSpec(biz_no=w["biz_no"],
+                                       company_name=w["company_name"],
+                                       historical_rates=w["rates"],
+                                       wins=w["wins"])
+                        for w in winners
+                    ]
+                    report = run_simulation(
+                        notice_id=notice.notice_id,
+                        base_amount=notice.base_amount,
+                        floor_rate=notice.floor_rate,
+                        predicted_rate=analysis.blended_rate,
+                        lower_rate=analysis.lower_rate,
+                        upper_rate=analysis.upper_rate,
+                        predicted_amount=analysis.recommended_amount,
+                        competitors=comps,
+                        n_customers=int(num_customers),
+                        num_runs=int(num_runs),
+                        seed=42 + i,
+                    )
+                    reports.append({
+                        "notice": notice,
+                        "report": report,
+                        "parent_used": parent_used,
+                        "confidence": analysis.confidence,
+                    })
+                    if persist:
+                        for cb in report.customers:
+                            batch_rows.append({
+                                "notice_id": notice.notice_id,
+                                "bid_amount": cb.amount,
+                                "bid_rate": cb.rate,
+                                "predicted_amount": analysis.recommended_amount,
+                                "predicted_rate": analysis.blended_rate,
+                                "note": f"sim_win_rate={report.our_win_rate:.3f}",
+                                "customer_idx": cb.idx,
+                            })
+                except Exception as exc:  # noqa: BLE001
+                    reports.append({"notice": notice, "error": str(exc)})
+                progress.progress((i + 1) / len(notices),
+                                    text=f"{i + 1}/{len(notices)} 처리 중...")
+            progress.empty()
+            if persist and batch_rows:
+                save_mock_bid_batch(db_path, simulation_id, batch_rows)
+                st.success(f"완료. {len(reports)}개 공고 시뮬레이션 · 고객 입찰 {len(batch_rows)}건 저장 "
+                             f"(simulation_id={simulation_id}).")
+            else:
+                st.success(f"완료. {len(reports)}개 공고 시뮬레이션 (DB 저장 안 함).")
+            st.session_state["sim_last_reports"] = reports
+            st.session_state["sim_last_id"] = simulation_id if persist else None
+
+    reports = st.session_state.get("sim_last_reports") or []
+    if reports:
+        _render_sim_reports(reports, fee_rate)
+
+    st.markdown("### 💰 실현 수익 (실제 결과가 들어온 건만)")
+    summary = revenue_summary(db_path, fee_rate=fee_rate,
+                                simulation_id=st.session_state.get("sim_last_id"))
+    r1, r2, r3 = st.columns(3)
+    r1.metric("실현 낙찰 건수", summary["total_wins"])
+    r2.metric("낙찰 총액", f"{summary['total_won_amount']:,.0f} 원")
+    r3.metric(f"누적 수익 (@ {fee_pct:.2f}%)", f"{summary['total_revenue']:,.0f} 원")
+    if summary["daily"]:
+        daily_df = pd.DataFrame(summary["daily"])
+        daily_df["누적수익"] = daily_df[::-1]["revenue"].cumsum()[::-1]
+        st.markdown("##### 일별 수익")
+        st.dataframe(
+            daily_df.assign(
+                won_amount=daily_df["won_amount"].map(lambda v: f"{v:,.0f}"),
+                revenue=daily_df["revenue"].map(lambda v: f"{v:,.0f}"),
+                누적수익=daily_df["누적수익"].map(lambda v: f"{v:,.0f}"),
+            ).rename(columns={
+                "day": "개찰일", "wins": "낙찰건수",
+                "won_amount": "낙찰총액", "revenue": "일수익",
+            })[["개찰일", "낙찰건수", "낙찰총액", "일수익", "누적수익"]],
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        st.info("아직 실제 결과가 매핑된 낙찰 건이 없습니다. 추후 새로운 CSV 임포트 시 자동 반영.")
+
+    runs = list_simulation_ids(db_path)
+    if runs:
+        with st.expander("🗂 이전 시뮬레이션 배치"):
+            st.dataframe(pd.DataFrame(runs), hide_index=True, use_container_width=True)
+
+
+def _render_sim_reports(reports: list[dict], fee_rate: float) -> None:
+    st.markdown("### 📊 이번 배치 결과")
+    ok = [r for r in reports if "report" in r]
+    if not ok:
+        st.info("처리된 리포트가 없습니다.")
+        return
+    rows_summary = []
+    for r in ok:
+        notice = r["notice"]
+        rep = r["report"]
+        best = None
+        if rep.best_customer_idx:
+            best = next((c for c in rep.customers if c.idx == rep.best_customer_idx), None)
+        rows_summary.append({
+            "공고번호": notice.notice_id,
+            "기관": notice.agency_name,
+            "구분": notice.category,
+            "방법": notice.contract_method,
+            "예산": notice.base_amount,
+            "예측투찰가": rep.predicted_amount or 0,
+            "예측률": rep.predicted_rate or 0,
+            "고객수": len(rep.customers),
+            "고객_최저투찰가": min(c.amount for c in rep.customers) if rep.customers else 0,
+            "고객_최고투찰가": max(c.amount for c in rep.customers) if rep.customers else 0,
+            "경쟁사수": len(rep.competitors),
+            "시뮬승률": rep.our_win_rate,
+            "최고고객#": rep.best_customer_idx or 0,
+            "최고고객승률": rep.best_customer_win_rate or 0,
+            "예상수수료(승률기반)": (rep.our_win_rate or 0) * (rep.mean_winning_amount_when_we_win or 0) * fee_rate,
+            "부모통합": r.get("parent_used") or "",
+        })
+    df = pd.DataFrame(rows_summary)
+    disp = df.assign(
+        예산=df["예산"].map(lambda v: f"{v:,.0f}"),
+        예측투찰가=df["예측투찰가"].map(lambda v: f"{v:,.0f}"),
+        예측률=df["예측률"].map(lambda v: f"{v:.2f}%"),
+        고객_최저투찰가=df["고객_최저투찰가"].map(lambda v: f"{v:,.0f}"),
+        고객_최고투찰가=df["고객_최고투찰가"].map(lambda v: f"{v:,.0f}"),
+        시뮬승률=df["시뮬승률"].map(lambda v: f"{v * 100:.1f}%"),
+        최고고객승률=df["최고고객승률"].map(lambda v: f"{v * 100:.1f}%"),
+        **{"예상수수료(승률기반)": df["예상수수료(승률기반)"].map(lambda v: f"{v:,.0f}")},
+    )
+    st.dataframe(disp, hide_index=True, use_container_width=True,
+                   height=min(520, 52 + 35 * max(1, len(disp))))
+
+    # 기대 수수료 합계
+    expected_fee = df["예상수수료(승률기반)"].sum()
+    st.caption(f"📈 이번 배치 기대 수수료(승률 × 평균 낙찰금액 × fee) 합계: **{expected_fee:,.0f}원**")
+
+    # per-notice drill-down
+    nid_list = df["공고번호"].tolist()
+    pick = st.selectbox("공고 상세 선택 (고객/경쟁사 분포 보기)", ["(선택)"] + nid_list,
+                         key="sim_drill_pick")
+    if pick != "(선택)":
+        entry = next((r for r in ok if r["notice"].notice_id == pick), None)
+        if entry:
+            _render_sim_detail(entry)
+
+
+def _render_sim_detail(entry: dict) -> None:
+    notice = entry["notice"]
+    rep = entry["report"]
+    st.markdown(f"#### 🔍 {notice.notice_id} · {notice.agency_name}")
+    cust_df = pd.DataFrame([
+        {"고객#": c.idx, "투찰률": f"{c.rate:.3f}%",
+         "투찰금액": f"{c.amount:,.0f}원"}
+        for c in rep.customers
+    ])
+    st.markdown("##### 내 고객 투찰 내역")
+    st.dataframe(cust_df, hide_index=True, use_container_width=True)
+
+    comp_df = pd.DataFrame([
+        {"업체": c.company_name, "사업자번호": c.biz_no,
+         "과거 낙찰 수": c.wins,
+         "평균 투찰률": (
+             f"{(sum(c.historical_rates)/len(c.historical_rates)):.2f}%"
+             if c.historical_rates else "–"
+         ),
+         "분포(min~max)": (
+             f"{min(c.historical_rates):.2f} ~ {max(c.historical_rates):.2f}"
+             if c.historical_rates else "–"
+         )}
+        for c in rep.competitors
+    ])
+    st.markdown("##### 경쟁사 top-K 참조")
+    st.dataframe(comp_df, hide_index=True, use_container_width=True)
+
+
+def _stat_block(cases):
+    rates = [c.bid_rate for c in cases if 0 < c.bid_rate <= 105]
+    if not rates:
+        return {"n": 0, "mean": None, "median": None, "stdev": None, "min": None, "max": None}
+    import statistics
+    return {
+        "n": len(rates),
+        "mean": round(sum(rates) / len(rates), 3),
+        "median": round(statistics.median(rates), 3),
+        "stdev": round(statistics.pstdev(rates), 3) if len(rates) > 1 else 0.0,
+        "min": round(min(rates), 3),
+        "max": round(max(rates), 3),
+    }
+
+
+def _render_mapping_tab(db_path: str) -> None:
+    st.subheader("기관 통합 관리 (back office)")
+    st.caption(
+        "세부 기관의 표본이 부족할 때 부모 기관(단일 법인)으로 확장해 예측하는 규칙. "
+        "`approved` 만 실제 예측에 반영됩니다. `pending` 은 사람이 검토 후 승인해야 합니다."
+    )
+
+    with st.container(border=True):
+        col_a, col_b, col_c = st.columns([1, 1, 2])
+        with col_a:
+            if st.button("🌱 자동 시더 실행 (pending 채움)"):
+                with st.spinner("시드 생성 중..."):
+                    result = seed_agency_parent_mapping(db_path)
+                st.success(
+                    f"신규 {result['inserted']}건 추가 · unsafe {result['skipped_unsafe']} 그룹 건너뜀 · "
+                    f"총 {result['total_in_table']}건 보관"
+                )
+                _mapping_cache.clear()
+                st.rerun()
+        with col_b:
+            status_filter = st.selectbox(
+                "상태",
+                ["(전체)", "pending", "approved", "blacklisted"],
+                index=1,
+            )
+        with col_c:
+            search = st.text_input("기관명/부모 검색 (부분일치)", key="mapping_search")
+
+    status_param = None if status_filter == "(전체)" else status_filter
+    rows = _mapping_cache(db_path, status_param, search.strip() or None)
+    if not rows:
+        st.info("조건에 맞는 매핑이 없습니다. 먼저 시더를 돌리거나 필터를 조정하세요.")
+        return
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    st.caption(f"총 {len(df)}건 · 행을 클릭하면 아래에 통합 전/후 비교가 표시됩니다.")
+    selection = st.dataframe(
+        df.rename(columns={
+            "agency_name": "기관",
+            "parent_name": "부모",
+            "subunit_count": "부모 subunits",
+            "agency_case_count": "기관 낙찰수",
+            "parent_case_count": "부모 총 낙찰수",
+            "status": "상태",
+            "source": "출처",
+            "note": "메모",
+            "updated_at": "갱신",
+        }),
+        hide_index=True,
+        use_container_width=True,
+        height=min(400, 52 + 35 * max(1, len(df))),
+        on_select="rerun",
+        selection_mode="single-row",
+        key="mapping_table",
+    )
+
+    try:
+        idx = selection.selection.rows[0]  # type: ignore[attr-defined]
+    except Exception:
+        idx = None
+    if idx is None:
+        st.info("행을 선택하면 통합 전/후 비교가 열립니다.")
+        return
+
+    row = df.iloc[int(idx)].to_dict()
+    _render_mapping_detail(db_path, row)
+
+
+@st.cache_data(ttl=60)
+def _mapping_cache(db_path: str, status, search):
+    return [dict(r) for r in list_agency_parent_mappings(db_path, status=status, search=search)]
+
+
+def _render_mapping_detail(db_path: str, row: dict) -> None:
+    st.markdown("---")
+    agency = row["agency_name"]
+    parent = row["parent_name"] or ""
+    st.subheader(f"🔍 {agency} → 부모 `{parent or '(미지정)'}` 비교")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        category_label = st.selectbox(
+            "구분",
+            [label for label, _ in CATEGORY_DROPDOWN],
+            index=0,
+            key=f"mapdetail_cat_{agency}",
+        )
+    with c2:
+        method = st.text_input(
+            "계약방법 (선택, 정확 일치)",
+            key=f"mapdetail_method_{agency}",
+            placeholder="예: 제한경쟁 / 일반경쟁 / 협상에 의한 계약",
+        )
+    with c3:
+        st.write("")
+        st.write("")
+        st.caption(f"기관 낙찰 {row['agency_case_count']} · 부모 계 {row['parent_case_count']}")
+
+    category = dict(CATEGORY_DROPDOWN)[category_label]
+    method_param = method.strip() or None
+
+    # Panel A: agency alone
+    solo_cases = load_cases_for_agencies(
+        db_path, [agency], category=category, contract_method=method_param
+    )
+    # Panel B: agency + parent siblings (other approved + pending under same parent)
+    sibling_rows = [
+        r for r in _mapping_cache(db_path, None, None)
+        if r["parent_name"] == parent and r["agency_name"] != agency
+    ]
+    expanded_names = [agency, parent] + [r["agency_name"] for r in sibling_rows]
+    expanded_cases = load_cases_for_agencies(
+        db_path, expanded_names, category=category, contract_method=method_param
+    )
+
+    solo_stats = _stat_block(solo_cases)
+    exp_stats = _stat_block(expanded_cases)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown(f"### 🎯 단독 (세부 기관)\n**{agency}**")
+        st.metric("낙찰 사례 수", solo_stats["n"])
+        st.write(
+            f"평균 {solo_stats['mean']} · 중앙값 {solo_stats['median']} · stdev {solo_stats['stdev']}  \n"
+            f"범위 {solo_stats['min']} ~ {solo_stats['max']}"
+        )
+    with right:
+        st.markdown(f"### 🧩 부모 통합\n**{parent}** + subunit {len(expanded_names)-1}개")
+        st.metric("낙찰 사례 수", exp_stats["n"])
+        st.write(
+            f"평균 {exp_stats['mean']} · 중앙값 {exp_stats['median']} · stdev {exp_stats['stdev']}  \n"
+            f"범위 {exp_stats['min']} ~ {exp_stats['max']}"
+        )
+
+    if solo_stats["n"] and exp_stats["n"]:
+        try:
+            fig = go.Figure()
+            fig.add_trace(go.Histogram(
+                x=[c.bid_rate for c in solo_cases if 0 < c.bid_rate <= 105],
+                name=f"단독 (n={solo_stats['n']})", opacity=0.6, nbinsx=40,
+            ))
+            fig.add_trace(go.Histogram(
+                x=[c.bid_rate for c in expanded_cases if 0 < c.bid_rate <= 105],
+                name=f"통합 (n={exp_stats['n']})", opacity=0.55, nbinsx=40,
+            ))
+            fig.update_layout(
+                barmode="overlay",
+                xaxis_title="투찰률 (%)",
+                yaxis_title="건수",
+                height=320,
+                margin=dict(l=30, r=20, t=30, b=30),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"히스토그램 렌더 실패: {exc}")
+
+    with st.expander(f"단독 사례 {solo_stats['n']}건 (최근 20)"):
+        if solo_cases:
+            st.dataframe(
+                pd.DataFrame([
+                    {"공고": c.notice_id, "기관": c.agency_name, "구분": c.category,
+                     "방법": c.contract_method, "예산": c.base_amount, "낙찰가": c.award_amount,
+                     "투찰률": c.bid_rate, "개찰일": c.opened_at}
+                    for c in solo_cases[:20]
+                ]),
+                hide_index=True, use_container_width=True,
+            )
+    with st.expander(f"통합 추가 사례 미리보기 (부모+형제 중 최근 30)"):
+        extra = [c for c in expanded_cases if c.agency_name != agency][:30]
+        if extra:
+            st.dataframe(
+                pd.DataFrame([
+                    {"공고": c.notice_id, "기관": c.agency_name, "구분": c.category,
+                     "방법": c.contract_method, "투찰률": c.bid_rate, "개찰일": c.opened_at}
+                    for c in extra
+                ]),
+                hide_index=True, use_container_width=True,
+            )
+
+    st.markdown("### ✏️ 액션")
+    action_cols = st.columns([2, 2, 2, 3])
+    current_status = row["status"]
+    with action_cols[0]:
+        if st.button("✅ 승인 (approved)", key=f"approve_{agency}", disabled=current_status == "approved"):
+            update_agency_parent_status(db_path, agency, "approved",
+                                         note=row.get("note", "") or "")
+            _mapping_cache.clear()
+            st.success("승인됨. 다음 예측부터 반영됩니다.")
+            st.rerun()
+    with action_cols[1]:
+        if st.button("🚫 차단 (blacklisted)", key=f"block_{agency}", disabled=current_status == "blacklisted"):
+            update_agency_parent_status(db_path, agency, "blacklisted",
+                                         note=row.get("note", "") or "")
+            _mapping_cache.clear()
+            st.warning("차단됨. 이 기관은 부모 통합이 되지 않습니다.")
+            st.rerun()
+    with action_cols[2]:
+        if st.button("↩️ 대기로 되돌리기", key=f"pending_{agency}", disabled=current_status == "pending"):
+            update_agency_parent_status(db_path, agency, "pending",
+                                         note=row.get("note", "") or "")
+            _mapping_cache.clear()
+            st.info("pending 으로 되돌렸습니다.")
+            st.rerun()
+    with action_cols[3]:
+        new_note = st.text_input("메모", value=row.get("note", "") or "", key=f"note_{agency}")
+        if st.button("💾 메모 저장", key=f"save_note_{agency}"):
+            update_agency_parent_status(db_path, agency, current_status, note=new_note)
+            _mapping_cache.clear()
+            st.success("메모 저장됨.")
+            st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="G2B 입찰 예측 대시보드", layout="wide")
     st.title("G2B 입찰 예측 대시보드")
     st.caption(
-        "특정 기관의 과거 공고마다 `predict-notice`를 다시 돌려 예측 투찰가를 계산하고 "
-        "실제 낙찰가와 비교합니다."
+        "진행 중인 공고를 예측하고, 선택한 공고의 기관 과거 실적을 즉시 확인합니다."
     )
 
     with st.sidebar:
-        st.header("필터")
+        st.header("설정")
         db_path = st.text_input("DB 경로", value=DEFAULT_DB_PATH)
-        category_labels = [label for label, _ in CATEGORY_DROPDOWN]
-        category_label = st.selectbox("구분", category_labels, index=0)
-        min_notices = st.number_input("최소 공고 수", min_value=1, max_value=50, value=3, step=1)
+        fee_pct_global = st.number_input(
+            "기본 수수료 %", min_value=0.0, max_value=5.0, value=0.05,
+            step=0.01, format="%.2f",
+            help="리뷰·스냅샷 기본 수수료율. 모의 입찰 탭에서 개별 지정도 가능.",
+        )
 
         st.markdown("---")
         st.header("전략")
@@ -777,74 +1493,25 @@ def main() -> None:
             ),
         )
 
-    category = dict(CATEGORY_DROPDOWN)[category_label]
-
     if not Path(db_path).exists():
         st.error(f"DB 파일을 찾을 수 없습니다: {db_path}")
         st.stop()
 
-    agencies_all = list_agencies_with_backtestable_notices(db_path, category=category, min_notices=1)
-    if not agencies_all:
-        st.warning("조건을 만족하는 기관이 없습니다. DB 적재 상태를 확인하세요.")
-        st.stop()
-    agencies = [(name, count) for name, count in agencies_all if count >= int(min_notices)]
-
-    agency_sort_label = st.sidebar.radio(
-        "기관 정렬",
-        ["공고 수 많은 순", "가나다 순"],
-        index=0,
-    )
-    if agency_sort_label == "가나다 순":
-        agencies_sorted = sorted(agencies, key=lambda item: item[0])
-    else:
-        agencies_sorted = agencies  # already notice_count desc
-
-    search_query = st.text_input(
-        "기관 검색",
-        key="agency_search",
-        placeholder="예: 수자원공사, 교육청, 출판문화",
-        help=(
-            "기관명 일부만 입력하면 아래 드롭다운이 좁혀집니다. "
-            "입력 후 Enter 또는 입력창 바깥을 클릭하면 즉시 반영됩니다."
-        ),
-    )
-    needle = (search_query or "").strip().lower().replace(" ", "")
-    if needle:
-        # When searching, ignore the min_notices filter so rare agencies are still findable.
-        search_pool = agencies_all if agency_sort_label != "가나다 순" else sorted(agencies_all, key=lambda item: item[0])
-        filtered = [
-            (name, count)
-            for name, count in search_pool
-            if needle in name.lower().replace(" ", "")
-        ]
-    else:
-        filtered = agencies_sorted
-
-    if not filtered:
-        st.warning(
-            f"`{search_query}` 에 해당하는 기관이 없습니다. "
-            "검색어를 바꾸거나 구분(카테고리)을 다시 확인해 보세요."
-        )
-        st.stop()
-
-    st.caption(
-        f"🔎 매칭 기관 {len(filtered)}개 · 드롭다운에서도 타이핑하면 실시간 필터링됩니다."
-    )
-    label_for = {f"{name}  (n={count})": name for name, count in filtered}
-    select_key = f"agency_select_{needle}_{category or 'all'}_{len(filtered)}"
-    selected_label = st.selectbox("기관 선택", list(label_for.keys()), key=select_key)
-    agency = label_for[selected_label]
-
-    tab_back, tab_live = st.tabs(["📊 과거 백테스트", "📝 진행 중 공고"])
-
-    with tab_back:
-        df = _load_rows_for_agency(db_path, agency, category, target_win_probability)
-        _render_summary(df)
-        _render_chart(df)
-        _render_table(df)
+    tab_live, tab_mock, tab_map, tab_review = st.tabs([
+        "📝 진행 중 공고", "🎯 모의 입찰", "🧩 기관 통합 관리", "📈 주간 리뷰",
+    ])
 
     with tab_live:
         _render_live_view(db_path, target_win_probability)
+
+    with tab_mock:
+        _render_mock_tab(db_path, target_win_probability)
+
+    with tab_map:
+        _render_mapping_tab(db_path)
+
+    with tab_review:
+        _render_review_tab(db_path, fee_rate=float(fee_pct_global) / 100.0)
 
     with st.expander("데이터 스키마 / 컬럼 설명"):
         st.markdown(

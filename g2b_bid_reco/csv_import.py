@@ -121,7 +121,7 @@ def _import_single_file(conn, path: Path) -> ContractCsvFileImportResult:
             agency_code = _first_text(row, "수요기관코드", "공고기관코드")
             contract_method = _first_text(row, "표준계약방법", "입찰방법명", "낙찰방법명")
             region = _first_text(row, "수요기관법정동명")
-            opened_at = _first_text(row, "공고게시일자")
+            opened_at = _normalize_date(_first_text(row, "공고게시일자"))
             base_amount = _to_float(row.get("입찰추정가격")) or 0.0
 
             upsert_notice(
@@ -141,8 +141,9 @@ def _import_single_file(conn, path: Path) -> ContractCsvFileImportResult:
 
             contract_amount = _to_float(row.get("계약금액"))
             contract_id = _first_text(row, "계약번호", "계약요청접수번호", "이용자문서번호")
-            contract_date = _first_text(row, "기준일자")
+            contract_date = _normalize_date(_first_text(row, "기준일자"))
             winning_company = _first_text(row, "계약시점대표업체명")
+            winner_biz_no = _first_text(row, "업체사업자등록번호")
 
             if contract_id and contract_amount is not None:
                 upsert_contract(
@@ -166,6 +167,7 @@ def _import_single_file(conn, path: Path) -> ContractCsvFileImportResult:
                     winning_company=winning_company,
                     result_status="awarded",
                     category=category,
+                    winner_biz_no=winner_biz_no,
                 )
                 results_upserted += 1
 
@@ -240,6 +242,14 @@ def _first_text(row: dict[str, str], *keys: str) -> str:
         if text:
             return text
     return ""
+
+
+def _normalize_date(value: str) -> str:
+    """Convert YYYYMMDD to YYYY-MM-DD. Pass through other shapes untouched."""
+    text = (value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
 
 
 def _to_float(value: str | None) -> float | None:

@@ -86,14 +86,14 @@ class ContractCsvImportTest(unittest.TestCase):
         self.assertEqual(notice["contract_method"], "일반경쟁")
         self.assertEqual(notice["region"], "서울특별시")
         self.assertEqual(notice["base_amount"], 1000000.0)
-        self.assertEqual(notice["opened_at"], "20251020")
+        self.assertEqual(notice["opened_at"], "2025-10-20")
         self.assertEqual(bid_result["winning_company"], "낙찰사A")
         self.assertEqual(bid_result["award_amount"], 875000.0)
         self.assertAlmostEqual(bid_result["bid_rate"], 87.5, places=6)
         self.assertEqual(bid_result["bidder_count"], 0)
         self.assertEqual(contract["notice_id"], "R25BK00000001-002")
         self.assertEqual(contract["contract_amount"], 875000.0)
-        self.assertEqual(contract["contract_date"], "20251023")
+        self.assertEqual(contract["contract_date"], "2025-10-23")
 
     def test_import_accepts_directory_and_upserts_without_duplication(self) -> None:
         first_csv = self.csv_dir / "history-2024.csv"

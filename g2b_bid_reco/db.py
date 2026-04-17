@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS bid_notices (
 CREATE TABLE IF NOT EXISTS bid_results (
     notice_id TEXT PRIMARY KEY REFERENCES bid_notices(notice_id),
     winning_company TEXT,
+    winner_biz_no TEXT DEFAULT '',
     award_amount REAL NOT NULL,
     bid_rate REAL NOT NULL,
     bidder_count INTEGER NOT NULL,
@@ -58,6 +59,65 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
     feature_value TEXT NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS agency_parent_mapping (
+    agency_name TEXT PRIMARY KEY,
+    parent_name TEXT NOT NULL DEFAULT '',
+    subunit_count INTEGER NOT NULL DEFAULT 0,
+    agency_case_count INTEGER NOT NULL DEFAULT 0,
+    parent_case_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    source TEXT NOT NULL DEFAULT 'auto',
+    note TEXT NOT NULL DEFAULT '',
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS mock_bids (
+    mock_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    notice_id TEXT NOT NULL,
+    bid_amount REAL NOT NULL,
+    bid_rate REAL NOT NULL,
+    predicted_amount REAL,
+    predicted_rate REAL,
+    note TEXT NOT NULL DEFAULT '',
+    submitted_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS metrics_snapshots (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date TEXT NOT NULL UNIQUE,
+    notices_total INTEGER DEFAULT 0,
+    notices_new_7d INTEGER DEFAULT 0,
+    results_total INTEGER DEFAULT 0,
+    approved_mappings INTEGER DEFAULT 0,
+    pending_mappings INTEGER DEFAULT 0,
+    sim_batches INTEGER DEFAULT 0,
+    mock_bids_total INTEGER DEFAULT 0,
+    mock_wins INTEGER DEFAULT 0,
+    mock_lost INTEGER DEFAULT 0,
+    mock_pending INTEGER DEFAULT 0,
+    mock_disqualified INTEGER DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    revenue_total REAL DEFAULT 0,
+    revenue_7d REAL DEFAULT 0,
+    fee_rate REAL DEFAULT 0,
+    note TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS improvement_suggestions (
+    suggestion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    impact TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'proposed',
+    source TEXT NOT NULL DEFAULT 'manual',
+    metric_snapshot_id INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    note TEXT DEFAULT ''
+);
 """
 
 
@@ -74,6 +134,33 @@ def init_db(db_path: str | Path) -> None:
         conn.executescript(SCHEMA_SQL)
         _ensure_column(conn, "bid_notices", "agency_code", "TEXT DEFAULT ''")
         _ensure_column(conn, "procurement_plans", "agency_code", "TEXT DEFAULT ''")
+        _ensure_column(conn, "bid_results", "winner_biz_no", "TEXT DEFAULT ''")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notices_cat_method ON bid_notices(category, contract_method)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notices_agency ON bid_notices(agency_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notices_opened_at ON bid_notices(opened_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_results_winner_biz ON bid_results(winner_biz_no)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parent_mapping_parent ON agency_parent_mapping(parent_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parent_mapping_status ON agency_parent_mapping(status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mock_bids_notice ON mock_bids(notice_id)"
+        )
+        _ensure_column(conn, "mock_bids", "simulation_id", "TEXT DEFAULT ''")
+        _ensure_column(conn, "mock_bids", "customer_idx", "INTEGER DEFAULT 0")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mock_bids_simulation ON mock_bids(simulation_id)"
+        )
 
 
 def _ensure_column(
@@ -316,15 +403,18 @@ def upsert_bid_result(
     winning_company: str,
     result_status: str,
     category: str = "",
+    winner_biz_no: str = "",
 ) -> None:
     ensure_notice_stub(conn, notice_id, category=category)
     conn.execute(
         """
         INSERT INTO bid_results (
-            notice_id, winning_company, award_amount, bid_rate, bidder_count, result_status
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            notice_id, winning_company, winner_biz_no, award_amount, bid_rate,
+            bidder_count, result_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(notice_id) DO UPDATE SET
             winning_company = CASE WHEN excluded.winning_company != '' THEN excluded.winning_company ELSE bid_results.winning_company END,
+            winner_biz_no = CASE WHEN excluded.winner_biz_no != '' THEN excluded.winner_biz_no ELSE bid_results.winner_biz_no END,
             award_amount = CASE WHEN excluded.award_amount > 0 THEN excluded.award_amount ELSE bid_results.award_amount END,
             bid_rate = CASE WHEN excluded.bid_rate > 0 THEN excluded.bid_rate ELSE bid_results.bid_rate END,
             bidder_count = CASE WHEN excluded.bidder_count > 0 THEN excluded.bidder_count ELSE bid_results.bidder_count END,
@@ -333,6 +423,7 @@ def upsert_bid_result(
         (
             notice_id,
             winning_company,
+            winner_biz_no,
             award_amount,
             bid_rate,
             bidder_count,
@@ -454,66 +545,841 @@ def load_historical_cases_for_notice(
     db_path: str | Path,
     notice_id: str,
     cutoff_opened_at: str | None,
+    category: str | None = None,
+    contract_method: str | None = None,
+    agency_name: str | None = None,
 ) -> list[HistoricalBidCase]:
+    filters = [
+        "r.result_status = 'awarded'",
+        "n.base_amount > 0",
+        "n.agency_name != ''",
+        "n.contract_method != ''",
+        "r.bid_rate > 0",
+        "r.award_amount > 0",
+        "n.notice_id != ?",
+    ]
+    params: list = [notice_id]
+    if cutoff_opened_at:
+        filters.append("COALESCE(n.opened_at, '') < ?")
+        params.append(cutoff_opened_at)
+    if category:
+        filters.append("n.category = ?")
+        params.append(category)
+    if contract_method:
+        filters.append("n.contract_method = ?")
+        params.append(contract_method)
+    if agency_name:
+        filters.append("n.agency_name = ?")
+        params.append(agency_name)
+    where_sql = " AND ".join(filters)
+
     with connect(db_path) as conn:
-        if cutoff_opened_at:
+        rows = conn.execute(
+            f"""
+            SELECT
+                n.notice_id,
+                n.agency_name,
+                n.category,
+                n.contract_method,
+                n.region,
+                n.base_amount,
+                r.award_amount,
+                r.bid_rate,
+                r.bidder_count,
+                n.opened_at,
+                COALESCE(r.winning_company, '') AS winning_company
+            FROM bid_notices n
+            JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE {where_sql}
+            ORDER BY n.opened_at DESC, n.notice_id DESC
+            """,
+            params,
+        ).fetchall()
+
+    return [
+        HistoricalBidCase(
+            notice_id=row["notice_id"],
+            agency_name=row["agency_name"],
+            category=row["category"],
+            contract_method=row["contract_method"],
+            region=row["region"],
+            base_amount=row["base_amount"],
+            award_amount=row["award_amount"],
+            bid_rate=row["bid_rate"],
+            bidder_count=row["bidder_count"],
+            opened_at=row["opened_at"],
+            winning_company=row["winning_company"],
+        )
+        for row in rows
+    ]
+
+
+# Code prefixes considered safe for auto-seeded parent aggregation.
+# Only single-legal-entity hierarchies (central ministries, public corporations).
+# Excludes local governments (3-6, Z0 social welfare), education offices (7-9).
+_SAFE_PARENT_PREFIXES = ("1", "A", "B", "D")
+
+
+def _parent_token(agency_name: str) -> str:
+    agency_name = (agency_name or "").strip()
+    if not agency_name or " " not in agency_name:
+        return ""
+    return agency_name.split(" ", 1)[0]
+
+
+def seed_agency_parent_mapping(
+    db_path: str | Path,
+    min_subunits: int = 10,
+    min_parent_cases: int = 50,
+    refresh: bool = False,
+) -> dict:
+    """Populate agency_parent_mapping with first-token-based parent suggestions.
+
+    Only inserts rows for agencies belonging to a parent that (a) has at least
+    `min_subunits` distinct sub-units, (b) has at least `min_parent_cases`
+    awarded cases, and (c) whose member code prefixes are all within the safe
+    single-entity set. Existing rows are preserved unless `refresh=True`.
+    """
+    with connect(db_path) as conn:
+        if refresh:
+            conn.execute("DELETE FROM agency_parent_mapping WHERE source='auto'")
+
+        agency_stats = conn.execute(
+            """
+            SELECT n.agency_name,
+                   SUBSTR(n.agency_code,1,1) AS code1,
+                   COUNT(DISTINCT n.notice_id) AS notices,
+                   SUM(CASE WHEN r.bid_rate > 0 THEN 1 ELSE 0 END) AS awarded
+            FROM bid_notices n
+            LEFT JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE n.agency_name != ''
+            GROUP BY n.agency_name
+            """
+        ).fetchall()
+
+        parent_buckets: dict[str, list[sqlite3.Row]] = {}
+        for row in agency_stats:
+            token = _parent_token(row["agency_name"])
+            if not token:
+                continue
+            parent_buckets.setdefault(token, []).append(row)
+
+        inserted = 0
+        skipped_unsafe = 0
+        skipped_small = 0
+        for parent, rows in parent_buckets.items():
+            if len(rows) < min_subunits:
+                skipped_small += 1
+                continue
+            parent_awarded_total = sum(row["awarded"] or 0 for row in rows)
+            if parent_awarded_total < min_parent_cases:
+                skipped_small += 1
+                continue
+            prefixes = {row["code1"] for row in rows if row["code1"]}
+            if not prefixes or not prefixes.issubset(set(_SAFE_PARENT_PREFIXES)):
+                skipped_unsafe += 1
+                continue
+            for row in rows:
+                if row["agency_name"] == parent:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO agency_parent_mapping (
+                        agency_name, parent_name, subunit_count,
+                        agency_case_count, parent_case_count,
+                        status, source, note, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', 'auto', '', CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        row["agency_name"],
+                        parent,
+                        len(rows),
+                        row["awarded"] or 0,
+                        parent_awarded_total,
+                    ),
+                )
+                if conn.total_changes:
+                    inserted += 1
+        total = conn.execute("SELECT COUNT(*) FROM agency_parent_mapping").fetchone()[0]
+    return {
+        "inserted": inserted,
+        "skipped_unsafe": skipped_unsafe,
+        "skipped_small": skipped_small,
+        "total_in_table": total,
+    }
+
+
+def get_agency_parent(db_path: str | Path, agency_name: str) -> sqlite3.Row | None:
+    with connect(db_path) as conn:
+        return conn.execute(
+            "SELECT * FROM agency_parent_mapping WHERE agency_name = ?",
+            (agency_name,),
+        ).fetchone()
+
+
+def list_agency_parent_mappings(
+    db_path: str | Path,
+    status: str | None = None,
+    parent_name: str | None = None,
+    search: str | None = None,
+) -> list[sqlite3.Row]:
+    filters: list[str] = []
+    params: list = []
+    if status:
+        filters.append("status = ?")
+        params.append(status)
+    if parent_name:
+        filters.append("parent_name = ?")
+        params.append(parent_name)
+    if search:
+        filters.append("(agency_name LIKE ? OR parent_name LIKE ?)")
+        params.extend([f"%{search}%", f"%{search}%"])
+    where_sql = (" WHERE " + " AND ".join(filters)) if filters else ""
+    with connect(db_path) as conn:
+        return conn.execute(
+            f"""
+            SELECT agency_name, parent_name, subunit_count,
+                   agency_case_count, parent_case_count,
+                   status, source, note, updated_at
+            FROM agency_parent_mapping
+            {where_sql}
+            ORDER BY status ASC, agency_case_count ASC, agency_name ASC
+            """,
+            params,
+        ).fetchall()
+
+
+def update_agency_parent_status(
+    db_path: str | Path,
+    agency_name: str,
+    status: str,
+    note: str = "",
+    parent_name: str | None = None,
+) -> None:
+    if status not in ("pending", "approved", "blacklisted"):
+        raise ValueError(f"invalid status: {status}")
+    with connect(db_path) as conn:
+        if parent_name is not None:
+            conn.execute(
+                """
+                UPDATE agency_parent_mapping
+                SET status=?, note=?, parent_name=?,
+                    source=CASE WHEN source='auto' AND ?='' THEN 'auto' ELSE 'manual' END,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE agency_name=?
+                """,
+                (status, note, parent_name, note, agency_name),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE agency_parent_mapping
+                SET status=?, note=?, source=CASE WHEN source='auto' AND ?='' THEN 'auto' ELSE 'manual' END,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE agency_name=?
+                """,
+                (status, note, note, agency_name),
+            )
+
+
+def save_mock_bid(
+    db_path: str | Path,
+    notice_id: str,
+    bid_amount: float,
+    bid_rate: float,
+    predicted_amount: float | None = None,
+    predicted_rate: float | None = None,
+    note: str = "",
+    simulation_id: str = "",
+    customer_idx: int = 0,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
+                predicted_amount, predicted_rate, note, simulation_id,
+                customer_idx, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (notice_id, bid_amount, bid_rate, predicted_amount, predicted_rate,
+             note, simulation_id, customer_idx),
+        )
+        return int(cur.lastrowid)
+
+
+def save_mock_bid_batch(
+    db_path: str | Path,
+    simulation_id: str,
+    rows: list[dict],
+) -> int:
+    """Insert many mock bids in one transaction. Each row must have keys:
+    notice_id, bid_amount, bid_rate, predicted_amount, predicted_rate,
+    note, customer_idx."""
+    if not rows:
+        return 0
+    with connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
+                predicted_amount, predicted_rate, note, simulation_id,
+                customer_idx, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [
+                (r["notice_id"], r["bid_amount"], r["bid_rate"],
+                 r.get("predicted_amount"), r.get("predicted_rate"),
+                 r.get("note", ""), simulation_id, r.get("customer_idx", 0))
+                for r in rows
+            ],
+        )
+    return len(rows)
+
+
+def list_simulation_ids(db_path: str | Path) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT simulation_id,
+                   COUNT(*) AS customer_bids,
+                   COUNT(DISTINCT notice_id) AS notices,
+                   MIN(submitted_at) AS started_at
+            FROM mock_bids
+            WHERE simulation_id != ''
+            GROUP BY simulation_id
+            ORDER BY started_at DESC
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def revenue_summary(
+    db_path: str | Path,
+    fee_rate: float,
+    simulation_id: str | None = None,
+) -> dict:
+    """Compute realized revenue = SUM(bid_amount * fee_rate) for mock bids
+    whose actual notice result indicates a win (our amount < actual),
+    grouped by notice opened_at date. Ignores pending and disqualified rows.
+    """
+    filters = [
+        "r.notice_id IS NOT NULL",
+        "r.award_amount > 0",
+        "r.bid_rate > 0",
+        "m.bid_amount < r.award_amount",
+        "(n.floor_rate IS NULL OR n.floor_rate <= 0 OR m.bid_rate >= n.floor_rate)",
+    ]
+    params: list = []
+    if simulation_id:
+        filters.append("m.simulation_id = ?")
+        params.append(simulation_id)
+    where_sql = " AND ".join(filters)
+    with connect(db_path) as conn:
+        total_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS wins, COALESCE(SUM(m.bid_amount),0) AS won_total
+            FROM mock_bids m
+            LEFT JOIN bid_notices n ON n.notice_id = m.notice_id
+            LEFT JOIN bid_results r ON r.notice_id = m.notice_id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        daily_rows = conn.execute(
+            f"""
+            SELECT substr(COALESCE(n.opened_at,''),1,10) AS day,
+                   COUNT(*) AS wins,
+                   SUM(m.bid_amount) AS won_total
+            FROM mock_bids m
+            LEFT JOIN bid_notices n ON n.notice_id = m.notice_id
+            LEFT JOIN bid_results r ON r.notice_id = m.notice_id
+            WHERE {where_sql}
+            GROUP BY day
+            ORDER BY day DESC
+            """,
+            params,
+        ).fetchall()
+    total_won = total_row["won_total"] or 0.0
+    total_wins = total_row["wins"] or 0
+    return {
+        "fee_rate": fee_rate,
+        "total_wins": total_wins,
+        "total_won_amount": total_won,
+        "total_revenue": round(total_won * fee_rate, 2),
+        "daily": [
+            {
+                "day": row["day"] or "(미상)",
+                "wins": row["wins"],
+                "won_amount": row["won_total"] or 0.0,
+                "revenue": round((row["won_total"] or 0.0) * fee_rate, 2),
+            }
+            for row in daily_rows
+        ],
+    }
+
+
+def compute_weekly_metrics(db_path: str | Path, fee_rate: float = 0.0005) -> dict:
+    """Compute current KPIs for weekly review. Does NOT write to DB."""
+    with connect(db_path) as conn:
+        notices_total = conn.execute("SELECT COUNT(*) FROM bid_notices").fetchone()[0]
+        notices_new_7d = conn.execute(
+            "SELECT COUNT(*) FROM bid_notices WHERE opened_at >= date('now','-7 days')"
+        ).fetchone()[0]
+        results_total = conn.execute("SELECT COUNT(*) FROM bid_results").fetchone()[0]
+        approved_mappings = conn.execute(
+            "SELECT COUNT(*) FROM agency_parent_mapping WHERE status='approved'"
+        ).fetchone()[0]
+        pending_mappings = conn.execute(
+            "SELECT COUNT(*) FROM agency_parent_mapping WHERE status='pending'"
+        ).fetchone()[0]
+        sim_batches = conn.execute(
+            "SELECT COUNT(DISTINCT simulation_id) FROM mock_bids WHERE simulation_id != ''"
+        ).fetchone()[0]
+        mock_bids_total = conn.execute("SELECT COUNT(*) FROM mock_bids").fetchone()[0]
+    mocks = list_mock_bids(db_path)
+    counts = {"won": 0, "lost": 0, "pending": 0, "disqualified": 0}
+    for m in mocks:
+        counts[m["verdict"]] = counts.get(m["verdict"], 0) + 1
+    resolved = counts["won"] + counts["lost"] + counts["disqualified"]
+    win_rate = (counts["won"] / resolved) if resolved else 0.0
+    rev_all = revenue_summary(db_path, fee_rate=fee_rate)
+    with connect(db_path) as conn:
+        rev_7d_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(m.bid_amount),0)
+            FROM mock_bids m
+            LEFT JOIN bid_notices n ON n.notice_id=m.notice_id
+            LEFT JOIN bid_results r ON r.notice_id=m.notice_id
+            WHERE r.award_amount > 0 AND r.bid_rate > 0
+              AND m.bid_amount < r.award_amount
+              AND (n.floor_rate IS NULL OR n.floor_rate <= 0 OR m.bid_rate >= n.floor_rate)
+              AND substr(COALESCE(n.opened_at,''),1,10) >= date('now','-7 days')
+            """
+        ).fetchone()
+    rev_7d = float(rev_7d_row[0] or 0) * fee_rate
+    return {
+        "snapshot_date": None,  # caller sets
+        "notices_total": notices_total,
+        "notices_new_7d": notices_new_7d,
+        "results_total": results_total,
+        "approved_mappings": approved_mappings,
+        "pending_mappings": pending_mappings,
+        "sim_batches": sim_batches,
+        "mock_bids_total": mock_bids_total,
+        "mock_wins": counts["won"],
+        "mock_lost": counts["lost"],
+        "mock_pending": counts["pending"],
+        "mock_disqualified": counts["disqualified"],
+        "win_rate": round(win_rate, 4),
+        "revenue_total": rev_all["total_revenue"],
+        "revenue_7d": round(rev_7d, 2),
+        "fee_rate": fee_rate,
+    }
+
+
+def take_weekly_snapshot(
+    db_path: str | Path, fee_rate: float = 0.0005, note: str = "",
+) -> int:
+    from datetime import date
+    m = compute_weekly_metrics(db_path, fee_rate=fee_rate)
+    today = date.today().isoformat()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO metrics_snapshots (
+                snapshot_date, notices_total, notices_new_7d, results_total,
+                approved_mappings, pending_mappings, sim_batches,
+                mock_bids_total, mock_wins, mock_lost, mock_pending, mock_disqualified,
+                win_rate, revenue_total, revenue_7d, fee_rate, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                notices_total=excluded.notices_total,
+                notices_new_7d=excluded.notices_new_7d,
+                results_total=excluded.results_total,
+                approved_mappings=excluded.approved_mappings,
+                pending_mappings=excluded.pending_mappings,
+                sim_batches=excluded.sim_batches,
+                mock_bids_total=excluded.mock_bids_total,
+                mock_wins=excluded.mock_wins,
+                mock_lost=excluded.mock_lost,
+                mock_pending=excluded.mock_pending,
+                mock_disqualified=excluded.mock_disqualified,
+                win_rate=excluded.win_rate,
+                revenue_total=excluded.revenue_total,
+                revenue_7d=excluded.revenue_7d,
+                fee_rate=excluded.fee_rate,
+                note=excluded.note
+            """,
+            (today, m["notices_total"], m["notices_new_7d"], m["results_total"],
+             m["approved_mappings"], m["pending_mappings"], m["sim_batches"],
+             m["mock_bids_total"], m["mock_wins"], m["mock_lost"],
+             m["mock_pending"], m["mock_disqualified"],
+             m["win_rate"], m["revenue_total"], m["revenue_7d"],
+             m["fee_rate"], note),
+        )
+        row_id = cur.lastrowid
+    return int(row_id or 0)
+
+
+def list_metrics_snapshots(db_path: str | Path, limit: int = 12) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM metrics_snapshots ORDER BY snapshot_date DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_suggestion(
+    db_path: str | Path,
+    title: str,
+    description: str = "",
+    rationale: str = "",
+    impact: str = "medium",
+    source: str = "manual",
+    metric_snapshot_id: int | None = None,
+) -> int:
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO improvement_suggestions (
+                title, description, rationale, impact, source, metric_snapshot_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (title, description, rationale, impact, source, metric_snapshot_id),
+        )
+    return int(cur.lastrowid or 0)
+
+
+def list_suggestions(
+    db_path: str | Path, status: str | None = None, limit: int = 100,
+) -> list[dict]:
+    with connect(db_path) as conn:
+        if status:
             rows = conn.execute(
                 """
-                SELECT
-                    n.notice_id,
-                    n.agency_name,
-                    n.category,
-                    n.contract_method,
-                    n.region,
-                    n.base_amount,
-                    r.award_amount,
-                    r.bid_rate,
-                    r.bidder_count,
-                    n.opened_at,
-                    COALESCE(r.winning_company, '') AS winning_company
-                FROM bid_notices n
-                JOIN bid_results r ON r.notice_id = n.notice_id
-                WHERE r.result_status = 'awarded'
-                  AND n.base_amount > 0
-                  AND n.agency_name != ''
-                  AND n.contract_method != ''
-                  AND r.bid_rate > 0
-                  AND r.award_amount > 0
-                  AND n.notice_id != ?
-                  AND COALESCE(n.opened_at, '') < ?
-                ORDER BY n.opened_at DESC, n.notice_id DESC
+                SELECT * FROM improvement_suggestions WHERE status=?
+                ORDER BY CASE impact WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                         updated_at DESC LIMIT ?
                 """,
-                (notice_id, cutoff_opened_at),
+                (status, limit),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                SELECT
-                    n.notice_id,
-                    n.agency_name,
-                    n.category,
-                    n.contract_method,
-                    n.region,
-                    n.base_amount,
-                    r.award_amount,
-                    r.bid_rate,
-                    r.bidder_count,
-                    n.opened_at,
-                    COALESCE(r.winning_company, '') AS winning_company
-                FROM bid_notices n
-                JOIN bid_results r ON r.notice_id = n.notice_id
-                WHERE r.result_status = 'awarded'
-                  AND n.base_amount > 0
-                  AND n.agency_name != ''
-                  AND n.contract_method != ''
-                  AND r.bid_rate > 0
-                  AND r.award_amount > 0
-                  AND n.notice_id != ?
-                ORDER BY n.opened_at DESC, n.notice_id DESC
+                SELECT * FROM improvement_suggestions
+                ORDER BY CASE status
+                    WHEN 'proposed' THEN 0 WHEN 'approved' THEN 1
+                    WHEN 'implemented' THEN 2 WHEN 'rejected' THEN 3 ELSE 4 END,
+                    CASE impact WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                    updated_at DESC LIMIT ?
                 """,
-                (notice_id,),
+                (limit,),
             ).fetchall()
+    return [dict(r) for r in rows]
 
+
+def update_suggestion(
+    db_path: str | Path,
+    suggestion_id: int,
+    status: str | None = None,
+    note: str | None = None,
+) -> None:
+    sets: list[str] = []
+    params: list = []
+    if status is not None:
+        if status not in ("proposed", "approved", "implemented", "rejected"):
+            raise ValueError(f"invalid suggestion status: {status}")
+        sets.append("status=?")
+        params.append(status)
+    if note is not None:
+        sets.append("note=?")
+        params.append(note)
+    if not sets:
+        return
+    sets.append("updated_at=CURRENT_TIMESTAMP")
+    params.append(suggestion_id)
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE improvement_suggestions SET {', '.join(sets)} WHERE suggestion_id=?",
+            params,
+        )
+
+
+def auto_generate_suggestions(db_path: str | Path) -> list[int]:
+    """Lightweight rule-based suggestion generator. Called after a snapshot.
+
+    Compares the latest two snapshots (if available) and inserts suggestions
+    for clear regressions/opportunities. Idempotent per-day via title.
+    """
+    snaps = list_metrics_snapshots(db_path, limit=2)
+    if not snaps:
+        return []
+    cur = snaps[0]
+    prev = snaps[1] if len(snaps) >= 2 else None
+
+    created: list[int] = []
+
+    def _exists(title: str) -> bool:
+        with connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM improvement_suggestions WHERE title=? AND status IN ('proposed','approved') LIMIT 1",
+                (title,),
+            ).fetchone()
+        return bool(row)
+
+    if prev is not None:
+        rev_delta = (cur["revenue_7d"] or 0) - (prev["revenue_7d"] or 0)
+        if prev["revenue_7d"] and rev_delta < 0:
+            title = "7일 수익 감소: 전략/데이터 신선도 점검"
+            if not _exists(title):
+                created.append(add_suggestion(
+                    db_path, title,
+                    description="최근 7일 수익이 직전 스냅샷 대비 감소. target_win_probability, 경쟁사 top-K, 부모 통합 범위를 재점검.",
+                    rationale=f"revenue_7d: {prev['revenue_7d']:,.0f} → {cur['revenue_7d']:,.0f} (Δ {rev_delta:+,.0f})",
+                    impact="high", source="auto",
+                ))
+        if prev["win_rate"] and cur["win_rate"] + 1e-6 < prev["win_rate"]:
+            title = "모의 승률 하락"
+            if not _exists(title):
+                created.append(add_suggestion(
+                    db_path, title,
+                    description="전주 대비 모의 승률 하락. 경쟁사 분포 변화 또는 예측 모델 드리프트 의심.",
+                    rationale=f"win_rate: {prev['win_rate']:.3f} → {cur['win_rate']:.3f}",
+                    impact="medium", source="auto",
+                ))
+
+    if cur["approved_mappings"] == 0 and cur["pending_mappings"] >= 50:
+        title = "부모 통합 승인이 아직 0건"
+        if not _exists(title):
+            created.append(add_suggestion(
+                db_path, title,
+                description="자동 시더가 pending 매핑을 쌓았지만 approved가 0. 기관 통합 관리 탭에서 소규모 공공기관 그룹을 승인해 효과 측정.",
+                rationale=f"pending={cur['pending_mappings']}, approved=0",
+                impact="medium", source="auto",
+            ))
+
+    if cur["mock_pending"] >= 50 and cur["mock_wins"] + cur["mock_lost"] == 0:
+        title = "시뮬 모의 입찰이 전부 pending — 실제 결과 보강 필요"
+        if not _exists(title):
+            created.append(add_suggestion(
+                db_path, title,
+                description="최근 모의 입찰 전부 pending. 새 CSV 임포트 또는 API 수집으로 실제 낙찰 결과를 붙여 판정 파이프라인을 검증.",
+                rationale=f"pending={cur['mock_pending']}, resolved=0",
+                impact="high", source="auto",
+            ))
+
+    return [c for c in created if c]
+
+
+def top_winners_for_scope(
+    db_path: str | Path,
+    agency_name: str,
+    category: str,
+    contract_method: str,
+    limit: int = 10,
+    base_amount: float | None = None,
+    base_amount_ratio: tuple[float, float] = (0.25, 4.0),
+) -> list[dict]:
+    """Return top-K winning bidders (by win count) for a notice scope,
+    each with their historical bid_rate list for sampling.
+
+    Scope: same category + contract_method. If base_amount given, restrict to
+    notices with base_amount in the ratio window around it.
+    """
+    filters = [
+        "n.category = ?",
+        "n.contract_method = ?",
+        "r.result_status = 'awarded'",
+        "r.bid_rate > 0",
+        "r.bid_rate <= 110",
+        "r.winner_biz_no != ''",
+    ]
+    params: list = [category, contract_method]
+    if base_amount and base_amount > 0:
+        lo, hi = base_amount_ratio
+        filters.append("n.base_amount BETWEEN ? AND ?")
+        params.extend([base_amount * lo, base_amount * hi])
+    where_sql = " AND ".join(filters)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT r.winner_biz_no AS biz_no,
+                   MAX(COALESCE(r.winning_company,'')) AS company_name,
+                   COUNT(*) AS wins,
+                   GROUP_CONCAT(r.bid_rate) AS rates_csv
+            FROM bid_notices n
+            JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE {where_sql}
+            GROUP BY r.winner_biz_no
+            ORDER BY wins DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        rates = []
+        for chunk in (row["rates_csv"] or "").split(","):
+            try:
+                rates.append(float(chunk))
+            except ValueError:
+                continue
+        out.append({
+            "biz_no": row["biz_no"],
+            "company_name": row["company_name"] or row["biz_no"],
+            "wins": row["wins"],
+            "rates": rates,
+        })
+    return out
+
+
+def delete_mock_bid(db_path: str | Path, mock_id: int) -> None:
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM mock_bids WHERE mock_id = ?", (mock_id,))
+
+
+def list_mock_bids(db_path: str | Path) -> list[dict]:
+    """Return mock bids joined with notice + live result to enable verdict."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT m.mock_id, m.notice_id, m.bid_amount, m.bid_rate,
+                   m.predicted_amount, m.predicted_rate, m.note, m.submitted_at,
+                   n.agency_name, n.category, n.contract_method, n.region,
+                   n.base_amount, n.floor_rate, n.opened_at,
+                   r.award_amount AS actual_amount, r.bid_rate AS actual_rate,
+                   COALESCE(r.winning_company,'') AS winning_company,
+                   COALESCE(r.result_status,'') AS result_status
+            FROM mock_bids m
+            LEFT JOIN bid_notices n ON n.notice_id = m.notice_id
+            LEFT JOIN bid_results r ON r.notice_id = m.notice_id
+            ORDER BY m.submitted_at DESC
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        d["verdict"] = _evaluate_mock_bid(d)
+        out.append(d)
+    return out
+
+
+def _evaluate_mock_bid(row: dict) -> str:
+    actual_rate = row.get("actual_rate")
+    actual_amount = row.get("actual_amount")
+    if actual_rate is None or actual_amount is None or actual_amount <= 0 or actual_rate <= 0:
+        return "pending"  # 아직 결과 미확정 (또는 DB에 결과 미적재)
+    floor = row.get("floor_rate")
+    my_rate = row.get("bid_rate") or 0
+    my_amount = row.get("bid_amount") or 0
+    if floor is not None and floor > 0 and my_rate < floor:
+        return "disqualified"  # 낙찰하한율 미달
+    # Lowest-price-wins assumption (적격심사·제한최저가). Equal = tie → loss.
+    if my_amount < actual_amount:
+        return "won"
+    return "lost"
+
+
+def resolve_adaptive_agencies(
+    db_path: str | Path,
+    agency_name: str,
+    category: str | None,
+    contract_method: str | None,
+    min_agency_cases: int = 10,
+) -> tuple[list[str], str | None]:
+    """Return (agency_names_to_include, parent_used_or_None).
+
+    If agency has an approved parent mapping AND its scoped case count is below
+    `min_agency_cases`, expand the pool to include all siblings under the
+    parent. Otherwise return just [agency_name].
+    """
+    if not agency_name:
+        return ([], None)
+    with connect(db_path) as conn:
+        mapping = conn.execute(
+            "SELECT parent_name, status FROM agency_parent_mapping WHERE agency_name=?",
+            (agency_name,),
+        ).fetchone()
+        if not mapping or mapping["status"] != "approved" or not mapping["parent_name"]:
+            return ([agency_name], None)
+
+        count_params: list = [agency_name]
+        filters = [
+            "n.agency_name = ?",
+            "r.result_status='awarded'",
+            "n.base_amount > 0",
+            "n.contract_method != ''",
+            "r.bid_rate > 0",
+            "r.award_amount > 0",
+        ]
+        if category:
+            filters.append("n.category = ?")
+            count_params.append(category)
+        if contract_method:
+            filters.append("n.contract_method = ?")
+            count_params.append(contract_method)
+        own_count = conn.execute(
+            f"SELECT COUNT(*) FROM bid_notices n JOIN bid_results r ON r.notice_id=n.notice_id WHERE {' AND '.join(filters)}",
+            count_params,
+        ).fetchone()[0]
+        if own_count >= min_agency_cases:
+            return ([agency_name], None)
+
+        siblings = conn.execute(
+            "SELECT agency_name FROM agency_parent_mapping WHERE parent_name=? AND status='approved'",
+            (mapping["parent_name"],),
+        ).fetchall()
+        names = {row["agency_name"] for row in siblings}
+        names.add(mapping["parent_name"])
+        names.add(agency_name)
+    return (sorted(names), mapping["parent_name"])
+
+
+def load_cases_for_agencies(
+    db_path: str | Path,
+    agency_names: list[str],
+    category: str | None = None,
+    contract_method: str | None = None,
+    cutoff_opened_at: str | None = None,
+    exclude_notice_id: str | None = None,
+) -> list[HistoricalBidCase]:
+    if not agency_names:
+        return []
+    placeholders = ",".join(["?"] * len(agency_names))
+    filters = [
+        f"n.agency_name IN ({placeholders})",
+        "r.result_status='awarded'",
+        "n.base_amount > 0",
+        "n.contract_method != ''",
+        "r.bid_rate > 0",
+        "r.award_amount > 0",
+    ]
+    params: list = list(agency_names)
+    if category:
+        filters.append("n.category = ?")
+        params.append(category)
+    if contract_method:
+        filters.append("n.contract_method = ?")
+        params.append(contract_method)
+    if cutoff_opened_at:
+        filters.append("COALESCE(n.opened_at, '') < ?")
+        params.append(cutoff_opened_at)
+    if exclude_notice_id:
+        filters.append("n.notice_id != ?")
+        params.append(exclude_notice_id)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT n.notice_id, n.agency_name, n.category, n.contract_method, n.region,
+                   n.base_amount, r.award_amount, r.bid_rate, r.bidder_count, n.opened_at,
+                   COALESCE(r.winning_company,'') AS winning_company
+            FROM bid_notices n JOIN bid_results r ON r.notice_id=n.notice_id
+            WHERE {' AND '.join(filters)}
+            ORDER BY n.opened_at DESC, n.notice_id DESC
+            """,
+            params,
+        ).fetchall()
     return [
         HistoricalBidCase(
             notice_id=row["notice_id"],
@@ -650,6 +1516,7 @@ def load_backtestable_notices_for_agency(
     db_path: str | Path,
     agency_name: str,
     category: str | None = None,
+    limit: int | None = None,
 ) -> list[tuple[BidNoticeSnapshot, ActualAwardOutcome]]:
     filters = [
         "n.agency_name = ?",
@@ -666,6 +1533,13 @@ def load_backtestable_notices_for_agency(
         params.append(category)
     where_sql = " AND ".join(filters)
 
+    tail = ""
+    if limit is not None:
+        tail = "ORDER BY n.opened_at DESC, n.notice_id DESC LIMIT ?"
+        params.append(int(limit))
+    else:
+        tail = "ORDER BY n.opened_at ASC, n.notice_id ASC"
+
     with connect(db_path) as conn:
         rows = conn.execute(
             f"""
@@ -678,7 +1552,7 @@ def load_backtestable_notices_for_agency(
             FROM bid_notices n
             JOIN bid_results r ON r.notice_id = n.notice_id
             WHERE {where_sql}
-            ORDER BY n.opened_at ASC, n.notice_id ASC
+            {tail}
             """,
             params,
         ).fetchall()

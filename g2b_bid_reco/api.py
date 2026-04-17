@@ -502,6 +502,7 @@ class PPSCollector:
             winning_company=_first_non_empty(item, ["sucsfbidprsnCmpyNm", "bidwinnrNm", "sucsfbidNm"], ""),
             result_status=_first_non_empty(item, ["opengRsltDivNm", "bidRsltNm"], "awarded"),
             category=category,
+            winner_biz_no=str(_first_non_empty(item, ["bidwinnrBizno", "sucsfbidprsnBizno", "bidprtcptBizno"], "") or ""),
         )
         return True
 
