@@ -1,0 +1,8 @@
+[project]
+name = "g2b-bid-recommender"
+version = "0.1.0"
+description = "MVP for recommending likely winning bid amounts from G2B procurement history"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
