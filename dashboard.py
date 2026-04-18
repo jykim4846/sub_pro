@@ -23,6 +23,7 @@ from g2b_bid_reco.db import (
     add_suggestion,
     auto_generate_suggestions,
     compute_weekly_metrics,
+    get_agency_parent,
     get_monitoring_alerts,
     get_monitoring_overview,
     get_operations_summary,
@@ -31,11 +32,13 @@ from g2b_bid_reco.db import (
     delete_mock_bid,
     get_actual_award,
     get_notice_snapshot,
+    search_notices,
     init_db,
     list_agencies_with_backtestable_notices,
     list_agency_parent_mappings,
     list_metrics_snapshots,
     list_pending_notice_prediction_rows,
+    list_run_tasks,
     list_simulation_ids,
     list_suggestions,
     load_backtestable_notices_for_agency,
@@ -267,6 +270,108 @@ def _inject_dashboard_styles() -> None:
           border-radius: 999px;
           background: linear-gradient(90deg, #2563eb, #06b6d4);
         }
+        .subpro-search-hero {
+          border-radius: 18px;
+          padding: 20px 22px 18px 22px;
+          margin: 0.25rem 0 1rem 0;
+          background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 60%, #0891b2 120%);
+          color: #f8fafc;
+          box-shadow: 0 14px 36px rgba(15, 23, 42, 0.18);
+        }
+        .subpro-search-hero h2 {
+          margin: 0 0 4px 0;
+          font-size: 1.3rem;
+          font-weight: 800;
+          letter-spacing: -0.02em;
+          color: #ffffff;
+        }
+        .subpro-search-hero p {
+          margin: 0;
+          font-size: 0.82rem;
+          color: rgba(226, 232, 240, 0.88);
+          line-height: 1.45;
+        }
+        .subpro-section-title {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 0.95rem;
+          font-weight: 800;
+          color: #0f172a;
+          margin: 1.1rem 0 0.55rem 0;
+          padding-left: 10px;
+          border-left: 4px solid #2563eb;
+          line-height: 1.2;
+        }
+        .subpro-section-title .subpro-section-meta {
+          font-size: 0.74rem;
+          font-weight: 600;
+          color: #64748b;
+          margin-left: 4px;
+        }
+        .subpro-notice-hero {
+          border-radius: 18px;
+          padding: 18px 20px;
+          background: linear-gradient(135deg, #eef2ff 0%, #ecfeff 55%, #f0fdf4 110%);
+          border: 1px solid rgba(99, 102, 241, 0.18);
+          box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+          margin: 0.25rem 0 0.9rem 0;
+        }
+        .subpro-notice-hero-top {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 14px;
+          flex-wrap: wrap;
+        }
+        .subpro-notice-agency {
+          font-size: 1.12rem;
+          font-weight: 800;
+          color: #0f172a;
+          letter-spacing: -0.02em;
+        }
+        .subpro-notice-id {
+          font-size: 0.78rem;
+          font-family: "SF Mono", ui-monospace, monospace;
+          color: #334155;
+          background: rgba(255,255,255,0.7);
+          padding: 3px 9px;
+          border-radius: 8px;
+          border: 1px solid rgba(15, 23, 42, 0.08);
+        }
+        .subpro-notice-sub {
+          margin-top: 6px;
+          display: flex;
+          gap: 16px;
+          flex-wrap: wrap;
+          font-size: 0.8rem;
+          color: #475569;
+        }
+        .subpro-notice-sub b { color: #0f172a; font-weight: 700; }
+        .subpro-result-highlight {
+          display: inline-flex;
+          gap: 8px;
+          align-items: center;
+          padding: 6px 12px;
+          border-radius: 10px;
+          font-size: 0.82rem;
+          font-weight: 700;
+          margin-top: 10px;
+        }
+        .subpro-result-won {
+          background: rgba(34, 197, 94, 0.14);
+          color: #166534;
+          border: 1px solid rgba(34, 197, 94, 0.26);
+        }
+        .subpro-result-pending {
+          background: rgba(251, 191, 36, 0.18);
+          color: #92400e;
+          border: 1px solid rgba(251, 191, 36, 0.32);
+        }
+        .subpro-quiet {
+          color: #64748b;
+          font-size: 0.82rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -365,11 +470,25 @@ def _run_status_snapshot(run: dict, stalled_after_minutes: float = 3.0) -> dict:
             "tone": "success",
             "minutes_since_update": minutes_since_update,
         }
+    if status == "partial":
+        return {
+            "label": "부분 완료",
+            "active": False,
+            "tone": "warning",
+            "minutes_since_update": minutes_since_update,
+        }
     if status == "failed":
         return {
             "label": "실패",
             "active": False,
             "tone": "error",
+            "minutes_since_update": minutes_since_update,
+        }
+    if status == "cancelled":
+        return {
+            "label": "취소됨",
+            "active": False,
+            "tone": "warning",
             "minutes_since_update": minutes_since_update,
         }
     return {
@@ -380,14 +499,96 @@ def _run_status_snapshot(run: dict, stalled_after_minutes: float = 3.0) -> dict:
     }
 
 
+def _track_run_history(run: dict) -> dict:
+    run_id = str(run.get("run_id") or "")
+    status = str(run.get("status") or "")
+    processed = int(run.get("processed_items") or 0)
+    success = int(run.get("success_items") or 0)
+    resumed = int(run.get("resumed_items") or 0)
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    state_key = "subpro_run_history"
+    history_state = st.session_state.setdefault(state_key, {})
+    # Reset samples when switching run_ids (plan 5절 rule).
+    if run_id and set(history_state.keys()) - {run_id}:
+        history_state.clear()
+    # If the run isn't actively running, drop throughput samples entirely.
+    zero_stats = {
+        "delta_processed_5m": 0,
+        "delta_success_5m": 0,
+        "rate_per_min_5m": 0.0,
+        "avg_rate_per_sec": 0.0,
+    }
+    snapshot = _run_status_snapshot(run)
+    if status != "running" or not snapshot.get("active"):
+        history_state.pop(run_id, None)
+        return zero_stats
+    history = list(history_state.get(run_id, []))
+    history.append({
+        "ts": now.isoformat(),
+        "processed": processed,
+        "success": success,
+    })
+    cutoff = now - pd.Timedelta(minutes=5)
+    trimmed = []
+    for item in history:
+        ts = pd.to_datetime(item.get("ts"), errors="coerce")
+        if pd.isna(ts) or ts < cutoff:
+            continue
+        trimmed.append(item)
+    history_state[run_id] = trimmed
+    if not trimmed:
+        return zero_stats
+
+    first = trimmed[0]
+    last = trimmed[-1]
+    first_ts = pd.to_datetime(first.get("ts"), errors="coerce")
+    last_ts = pd.to_datetime(last.get("ts"), errors="coerce")
+    delta_processed = max(0, int(last.get("processed", 0)) - int(first.get("processed", 0)))
+    delta_success = max(0, int(last.get("success", 0)) - int(first.get("success", 0)))
+    elapsed_seconds = max(1.0, (last_ts - first_ts).total_seconds()) if not (pd.isna(first_ts) or pd.isna(last_ts)) else 1.0
+    started_at = pd.to_datetime(run.get("started_at"), errors="coerce")
+    avg_elapsed_seconds = max(1.0, (now - started_at).total_seconds()) if not pd.isna(started_at) else elapsed_seconds
+    new_computed = max(0, processed - resumed)
+    return {
+        "delta_processed_5m": delta_processed,
+        "delta_success_5m": delta_success,
+        "rate_per_min_5m": (delta_processed / elapsed_seconds) * 60.0,
+        "avg_rate_per_sec": new_computed / avg_elapsed_seconds,
+    }
+
+
 def _resolve_default_db_path() -> str:
     env_path = os.environ.get("G2B_DB_PATH")
     if env_path:
         return env_path
+    local_path = Path("data/bids.db")
     runner_path = Path.home() / "Library/Application Support/sub_pro-runner/data/bids.db"
+
+    def _has_running_auto_bid(path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            with connect(path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM automation_runs
+                    WHERE kind = 'auto_bid_pending' AND status = 'running'
+                    ORDER BY COALESCE(updated_at, started_at) DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    if _has_running_auto_bid(local_path):
+        return str(local_path)
+    if _has_running_auto_bid(runner_path):
+        return str(runner_path)
     if runner_path.exists():
         return str(runner_path)
-    return "data/bids.db"
+    return str(local_path)
 
 
 DEFAULT_DB_PATH = _resolve_default_db_path()
@@ -982,8 +1183,23 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
     _render_notice_detail(db_path, detail_row)
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def _ops_summary_cached(db_path: str) -> dict:
+    return get_operations_summary(db_path)
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _monitoring_overview_cached(db_path: str) -> dict:
+    return get_monitoring_overview(db_path)
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _monitoring_alerts_cached(db_path: str) -> list:
+    return get_monitoring_alerts(db_path)
+
+
 def _render_operations_summary(db_path: str) -> None:
-    summary = get_operations_summary(db_path)
+    summary = _ops_summary_cached(db_path)
     st.subheader("운영 요약")
     st.caption("오늘 기준 진행 상태와 자동 모의 입찰 커버리지를 실시간으로 보여줍니다.")
     coverage_pct = (
@@ -1005,7 +1221,16 @@ def _render_operations_summary(db_path: str) -> None:
         _render_stat_card("오늘 API 호출", _format_count(summary["total_api_calls_today"], "회"), meta="수집 + 기관 API 합계", accent="#0f766e"),
         _render_stat_card("수집 API", _format_count(summary["collect_api_calls_today"], "회"), meta="입찰/결과/계약 수집", accent="#0284c7"),
         _render_stat_card("기관 API", _format_count(summary["agency_api_calls_today"], "회"), meta="수요기관 사용자정보", accent="#9333ea"),
-        _render_stat_card("오늘 자동입찰", _format_count(summary["auto_bid_notices_today"], "건"), meta="오늘 생성된 자동 포트폴리오", accent="#ca8a04"),
+        _render_stat_card(
+            "오늘 자동입찰",
+            _format_count(summary["auto_bid_notices_today"], "건"),
+            meta=(
+                f"현재 run 반영 {_format_count(summary['latest_auto_bid_saved_notices'], '건')}"
+                if summary.get("latest_auto_bid_saved_notices")
+                else "오늘 생성된 자동 포트폴리오"
+            ),
+            accent="#ca8a04",
+        ),
     ]
     st.markdown(f"<div class='subpro-card-grid'>{''.join(top_cards)}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='subpro-card-grid'>{''.join(api_cards)}</div>", unsafe_allow_html=True)
@@ -1015,11 +1240,41 @@ def _render_operations_summary(db_path: str) -> None:
         total = int(latest_run.get("total_items") or 0)
         success = int(latest_run.get("success_items") or 0)
         failed = int(latest_run.get("failed_items") or 0)
+        resumed = int(latest_run.get("resumed_items") or 0)
+        new_computed = int(summary.get("latest_auto_bid_new_computed") or 0)
         status = str(latest_run.get("status") or "")
-        badge = _status_badge_html(
-            "실행 중" if status == "running" else "완료" if status == "completed" else "실패",
-            tone="running" if status == "running" else "completed" if status == "completed" else "failed",
-        )
+        status_label_map = {
+            "running": ("실행 중", "running"),
+            "completed": ("완료", "completed"),
+            "partial": ("부분 완료", "running"),
+            "failed": ("실패", "failed"),
+            "cancelled": ("취소됨", "failed"),
+        }
+        label, tone = status_label_map.get(status, (status or "–", "neutral"))
+        badge = _status_badge_html(label, tone=tone)
+        active_task = summary.get("latest_auto_bid_active_task")
+        active_line = ""
+        if active_task:
+            at_processed = int(active_task.get("processed_items") or 0)
+            at_total = int(active_task.get("total_items") or 0)
+            active_line = (
+                f"<div class='subpro-summary-detail' style='margin-top:4px;'>"
+                f"🧩 active task · {active_task.get('category') or '–'}/{active_task.get('contract_method') or '–'} "
+                f"#{active_task.get('task_seq')} · {_format_count(at_processed)}/{_format_count(at_total)}"
+                f"</div>"
+            )
+        task_summary = summary.get("latest_auto_bid_task_summary") or {}
+        task_line = ""
+        if task_summary and task_summary.get("task_count"):
+            task_line = (
+                f"<div class='subpro-summary-detail' style='margin-top:4px;'>"
+                f"🗂 tasks · queued {_format_count(task_summary.get('queued_tasks') or 0)} · "
+                f"running {_format_count(task_summary.get('running_tasks') or 0)} · "
+                f"completed {_format_count(task_summary.get('completed_tasks') or 0)} · "
+                f"partial {_format_count(task_summary.get('partial_tasks') or 0)} · "
+                f"failed {_format_count(task_summary.get('failed_tasks') or 0)}"
+                f"</div>"
+            )
         st.markdown(
             (
                 "<div class='subpro-summary-band'>"
@@ -1027,14 +1282,16 @@ def _render_operations_summary(db_path: str) -> None:
                 "<div class='subpro-summary-title'>최근 자동 입찰 배치</div>"
                 f"<div class='subpro-summary-detail'>`{latest_run.get('run_id')}` · "
                 f"{_format_count(processed)}/{_format_count(total)} 공고 처리 ({summary['latest_auto_bid_progress_pct']:.1f}%) · "
+                f"resumed {_format_count(resumed)} · 신규 계산 {_format_count(new_computed)} · "
                 f"성공 {_format_count(success)} · 실패 {_format_count(failed)}</div>"
+                f"{active_line}{task_line}"
                 "</div>"
                 f"{badge}"
                 "</div>"
             ),
             unsafe_allow_html=True,
         )
-        if latest_run.get("status") == "running" and total > 0:
+        if status == "running" and total > 0:
             st.progress(min(1.0, processed / total))
     st.markdown("---")
 
@@ -1044,59 +1301,108 @@ def _render_operations_summary_fragment(db_path: str) -> None:
     _render_operations_summary(db_path)
 
 
+def _render_run_card(db_path: str, run: dict) -> None:
+    progress_ratio = _run_progress_ratio(run)
+    elapsed_minutes = _run_elapsed_minutes(run)
+    processed = int(run.get("processed_items") or 0)
+    total = int(run.get("total_items") or 0)
+    success = int(run.get("success_items") or 0)
+    failed = int(run.get("failed_items") or 0)
+    resumed = int(run.get("resumed_items") or 0)
+    new_computed = max(0, processed - resumed)
+    status_snapshot = _run_status_snapshot(run)
+    speed_stats = _track_run_history(run)
+    tone_for_label = {
+        "실행 중": "running",
+        "완료": "completed",
+        "부분 완료": "running",
+        "실패": "failed",
+        "멈춤 의심": "failed",
+        "취소됨": "failed",
+        "대기": "neutral",
+    }
+    badge = _status_badge_html(
+        status_snapshot["label"],
+        tone=tone_for_label.get(status_snapshot["label"], "neutral"),
+    )
+    progress_pct = progress_ratio * 100.0 if progress_ratio is not None else 0.0
+    progress_bar = (
+        "<div class='subpro-progress-track'>"
+        f"<div class='subpro-progress-bar' style='width:{progress_pct:.1f}%'></div>"
+        "</div>"
+    )
+    active_task = None
+    if str(run.get("kind") or "") == "auto_bid_pending" and status_snapshot.get("active"):
+        try:
+            from g2b_bid_reco.db import _latest_active_task as _get_active_task
+            active_task = _get_active_task(db_path, str(run.get("run_id") or ""))
+        except Exception:
+            active_task = None
+    task_meta = ""
+    if active_task:
+        at_proc = int(active_task.get("processed_items") or 0)
+        at_total = int(active_task.get("total_items") or 0)
+        task_meta = (
+            "<div class='subpro-run-meta'>🧩 active task · "
+            f"{active_task.get('category') or '–'}/{active_task.get('contract_method') or '–'} "
+            f"#{active_task.get('task_seq')} · {_format_count(at_proc)}/{_format_count(at_total)}</div>"
+        )
+    resumed_meta = (
+        f"<div class='subpro-run-meta'>resumed {_format_count(resumed)} · "
+        f"신규 계산 {_format_count(new_computed)}</div>"
+        if str(run.get("kind") or "") == "auto_bid_pending" else ""
+    )
+    st.markdown(
+        (
+            "<div class='subpro-run-card'>"
+            "<div class='subpro-run-head'>"
+            f"<div class='subpro-run-title'>{_kind_label(str(run.get('kind') or ''))}</div>"
+            f"{badge}"
+            "</div>"
+            f"{progress_bar}"
+            f"<div class='subpro-run-meta'>{_format_count(processed)}/{_format_count(total)} 처리 · "
+            f"성공 {_format_count(success)} · 실패 {_format_count(failed)} · 경과 {elapsed_minutes:.1f}분</div>"
+            f"{resumed_meta}"
+            f"<div class='subpro-run-meta'>최근 5분 {_format_count(speed_stats['delta_processed_5m'], '건')} · "
+            f"{speed_stats['rate_per_min_5m']:.1f}건/분 · 평균 {speed_stats['avg_rate_per_sec']:.1f}건/초</div>"
+            f"{task_meta}"
+            + (
+                f"<div class='subpro-run-meta'>현재 단계: {run.get('message')}</div>"
+                if run.get("message") else ""
+            )
+            + "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _render_realtime_status_content(db_path: str) -> None:
-    overview = get_monitoring_overview(db_path)
-    alerts = get_monitoring_alerts(db_path)
-    active_runs = [
-        run for run in overview["latest_runs"]
-        if _run_status_snapshot(run).get("active")
-    ]
+    overview = _monitoring_overview_cached(db_path)
+    alerts = _monitoring_alerts_cached(db_path)
+    fresh_active_runs: list[dict] = []
+    stalled_runs: list[dict] = []
+    for run in overview["latest_runs"]:
+        snap = _run_status_snapshot(run)
+        if snap.get("active"):
+            fresh_active_runs.append(run)
+        elif str(run.get("status") or "") == "running":
+            stalled_runs.append(run)
 
     st.subheader("운영 모니터링")
-    if active_runs:
-        st.caption("실행 중인 배치가 있어 이 영역만 5초마다 자동 갱신합니다.")
+    if fresh_active_runs or stalled_runs:
+        st.caption(
+            "실행 중/멈춤 의심 배치가 있어 이 영역만 15초마다 자동 갱신합니다."
+        )
+        if stalled_runs and not fresh_active_runs:
+            st.warning(
+                f"🚨 running 상태이지만 heartbeat가 멈춘 배치 {len(stalled_runs)}건이 있습니다. "
+                "최근 기록된 진행률만 보이며 실제로는 정체 중일 수 있습니다."
+            )
         st.markdown("#### 실시간 실행 현황")
-        for run in active_runs:
-            progress_ratio = _run_progress_ratio(run)
-            elapsed_minutes = _run_elapsed_minutes(run)
-            processed = int(run.get("processed_items") or 0)
-            total = int(run.get("total_items") or 0)
-            success = int(run.get("success_items") or 0)
-            failed = int(run.get("failed_items") or 0)
-            status_snapshot = _run_status_snapshot(run)
-            badge = _status_badge_html(
-                status_snapshot["label"],
-                tone=(
-                    "running" if status_snapshot["label"] == "실행 중"
-                    else "completed" if status_snapshot["label"] == "완료"
-                    else "failed" if status_snapshot["label"] in {"실패", "멈춤 의심"}
-                    else "neutral"
-                ),
-            )
-            progress_pct = progress_ratio * 100.0 if progress_ratio is not None else 0.0
-            progress_bar = (
-                "<div class='subpro-progress-track'>"
-                f"<div class='subpro-progress-bar' style='width:{progress_pct:.1f}%'></div>"
-                "</div>"
-            )
-            st.markdown(
-                (
-                    "<div class='subpro-run-card'>"
-                    "<div class='subpro-run-head'>"
-                    f"<div class='subpro-run-title'>{_kind_label(str(run.get('kind') or ''))}</div>"
-                    f"{badge}"
-                    "</div>"
-                    f"{progress_bar}"
-                    f"<div class='subpro-run-meta'>{_format_count(processed)}/{_format_count(total)} 처리 · "
-                    f"성공 {_format_count(success)} · 실패 {_format_count(failed)} · 경과 {elapsed_minutes:.1f}분</div>"
-                    + (
-                        f"<div class='subpro-run-meta'>현재 단계: {run.get('message')}</div>"
-                        if run.get("message") else ""
-                    )
-                    + "</div>"
-                ),
-                unsafe_allow_html=True,
-            )
+        for run in fresh_active_runs:
+            _render_run_card(db_path, run)
+        for run in stalled_runs:
+            _render_run_card(db_path, run)
     else:
         st.caption("실행 중인 배치가 없습니다. 자동 갱신은 이 영역에서만 최소 비용으로 동작합니다.")
 
@@ -1182,12 +1488,20 @@ def _render_mock_realtime_status_content(db_path: str) -> None:
     total = int(run.get("total_items") or 0)
     success = int(run.get("success_items") or 0)
     failed = int(run.get("failed_items") or 0)
+    resumed = int(run.get("resumed_items") or 0)
+    new_computed = max(0, processed - resumed)
     elapsed_minutes = _run_elapsed_minutes(run)
     progress_ratio = _run_progress_ratio(run)
+    speed_stats = _track_run_history(run)
     prev_processed_key = "mock_tab_prev_auto_bid_processed"
     prev_processed = int(st.session_state.get(prev_processed_key, processed))
     delta_processed = processed - prev_processed
     st.session_state[prev_processed_key] = processed
+    try:
+        from g2b_bid_reco.db import _latest_active_task as _get_active_task
+        active_task = _get_active_task(db_path, str(run.get("run_id") or ""))
+    except Exception:
+        active_task = None
 
     with st.container(border=True):
         st.markdown("### 실시간 자동 입찰 상태")
@@ -1197,6 +1511,25 @@ def _render_mock_realtime_status_content(db_path: str) -> None:
         s3.metric("성공", _format_count(success, "건"))
         s4.metric("실패", _format_count(failed, "건"))
         s5.metric("경과", f"{elapsed_minutes:.1f}분")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("resumed", _format_count(resumed, "건"))
+        r2.metric("신규 계산", _format_count(new_computed, "건"))
+        r3.metric(
+            "active task",
+            (
+                f"#{active_task['task_seq']} {active_task.get('category') or '–'}/{active_task.get('contract_method') or '–'}"
+                if active_task else "–"
+            ),
+            help=(
+                f"처리 {_format_count(int(active_task.get('processed_items') or 0))}/"
+                f"{_format_count(int(active_task.get('total_items') or 0))}"
+                if active_task else "실행 중 task 없음"
+            ),
+        )
+        m1, m2, m3 = st.columns(3)
+        m1.metric("최근 5분 처리", _format_count(speed_stats["delta_processed_5m"], "건"))
+        m2.metric("최근 5분 속도", f"{speed_stats['rate_per_min_5m']:.1f}건/분")
+        m3.metric("평균 속도", f"{speed_stats['avg_rate_per_sec']:.1f}건/초")
         if progress_ratio is not None:
             st.progress(progress_ratio)
             st.caption(
@@ -1220,6 +1553,11 @@ def _render_mock_realtime_status_content(db_path: str) -> None:
         st.caption(f"마지막 상태 갱신 {status_snapshot['minutes_since_update']:.1f}분 전")
         if status_snapshot["label"] == "완료":
             st.success("최근 자동 입찰 배치가 정상 완료됐습니다.")
+        elif status_snapshot["label"] == "부분 완료":
+            st.warning(
+                "일부 공고는 처리됐지만 전체 완료 전에 중단됐습니다. "
+                "다시 실행하면 이어서 계산합니다."
+            )
         elif status_snapshot["label"] == "실패":
             st.error("최근 자동 입찰 배치가 실패 상태로 종료됐습니다.")
         elif status_snapshot["label"] == "멈춤 의심":
@@ -1232,6 +1570,27 @@ def _render_mock_realtime_status_content(db_path: str) -> None:
                 "숫자가 바로 안 올라가더라도 큰 공고 묶음을 계산 중일 수 있습니다. "
                 "같은 값이 계속 유지되면 멈춤 여부를 추가 점검하면 됩니다."
             )
+
+    # Recent tasks for this run
+    try:
+        tasks = list_run_tasks(db_path, str(run.get("run_id") or ""))
+    except Exception:
+        tasks = []
+    if tasks:
+        with st.expander(f"🗂 최근 task {len(tasks)}건 (run_id={run.get('run_id')})"):
+            tdf = pd.DataFrame(tasks)
+            show = tdf[[
+                "task_seq", "category", "contract_method", "status",
+                "processed_items", "total_items", "success_items",
+                "failed_items", "started_at", "finished_at", "message",
+            ]].rename(columns={
+                "task_seq": "seq", "contract_method": "방법", "category": "구분",
+                "status": "상태", "processed_items": "처리", "total_items": "전체",
+                "success_items": "성공", "failed_items": "실패",
+                "started_at": "시작", "finished_at": "종료", "message": "메시지",
+            })
+            st.dataframe(show, hide_index=True, use_container_width=True,
+                           height=min(360, 52 + 35 * max(1, len(show))))
 
 
 @st.fragment(run_every="5s")
@@ -2038,6 +2397,259 @@ def _render_mapping_detail(db_path: str, row: dict) -> None:
             st.rerun()
 
 
+def _render_search_tab(db_path: str, target_win_probability: float) -> None:
+    st.markdown(
+        """
+        <div class='subpro-search-hero'>
+          <h2>🔍 공고 검색</h2>
+          <p>수요기관명 또는 공고번호로 전체 공고를 찾아봅니다.
+          결과 행을 클릭하면 공고 상세·낙찰 결과가 뜨고, <b>approved</b> 매핑 기관이라면
+          백테스트 꺾은선 차트까지 자동으로 나옵니다.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns([5, 2, 1.2])
+    with c1:
+        query = st.text_input(
+            "검색어",
+            key="search_query",
+            placeholder="🔎 기관명 일부 또는 공고번호  (예: 한국수자원공사 / R25BK01145814)",
+            label_visibility="collapsed",
+        )
+    with c2:
+        category_label = st.selectbox(
+            "구분",
+            [label for label, _ in CATEGORY_DROPDOWN],
+            index=0,
+            key="search_category",
+            label_visibility="collapsed",
+        )
+    with c3:
+        limit = st.number_input(
+            "최대 표시",
+            min_value=20, max_value=500, value=100, step=20,
+            key="search_limit",
+            label_visibility="collapsed",
+        )
+    category = dict(CATEGORY_DROPDOWN)[category_label]
+
+    needle = (query or "").strip()
+    if not needle:
+        st.markdown(
+            "<div class='subpro-quiet'>검색어를 입력하세요. 공고번호는 부분 일치도 됩니다.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    with st.spinner(f"‘{needle}’ 검색 중..."):
+        rows = search_notices(db_path, needle, category=category, limit=int(limit))
+    if not rows:
+        st.warning("결과가 없습니다. 검색어를 바꾸거나 구분을 다시 확인해 보세요.")
+        return
+
+    # Summary banner
+    resolved = sum(1 for r in rows if r.get("has_result") and (r.get("bid_rate") or 0) > 0)
+    pending = len(rows) - resolved
+    st.markdown(
+        "<div class='subpro-card-grid'>"
+        + _render_stat_card("매칭 공고", _format_count(len(rows), "건"),
+                             meta=f"검색어: {needle}", accent="#2563eb")
+        + _render_stat_card("결과 있음", _format_count(resolved, "건"),
+                             meta="낙찰가·낙찰업체 확인 가능", accent="#16a34a")
+        + _render_stat_card("결과 대기", _format_count(pending, "건"),
+                             meta="아직 낙찰 결과 없음", accent="#f59e0b")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    df = pd.DataFrame(rows)
+    display = df.assign(
+        category_label=df["category"].map(_humanize_category),
+        base_amount_fmt=df["base_amount"].map(lambda v: f"{v:,.0f}" if v else "–"),
+        award_amount_fmt=df["award_amount"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "–"),
+        bid_rate_fmt=df["bid_rate"].map(lambda v: f"{v:.2f}%" if pd.notna(v) and v > 0 else "–"),
+        result_badge=df.apply(
+            lambda r: "✅ 낙찰" if (r.get("has_result") and (r.get("bid_rate") or 0) > 0)
+            else "⏳ 대기",
+            axis=1,
+        ),
+    )[
+        [
+            "opened_at", "result_badge", "notice_id", "agency_name",
+            "category_label", "contract_method",
+            "base_amount_fmt", "award_amount_fmt", "bid_rate_fmt", "winning_company",
+        ]
+    ]
+    display.columns = [
+        "개찰일", "결과", "공고번호", "수요기관",
+        "구분", "방법",
+        "예산", "낙찰가", "낙찰률", "낙찰업체",
+    ]
+
+    selection = st.dataframe(
+        display,
+        hide_index=True,
+        use_container_width=True,
+        height=min(480, 52 + 35 * max(1, len(display))),
+        on_select="rerun",
+        selection_mode="single-row",
+        key="search_results_table",
+    )
+    try:
+        idx = selection.selection.rows[0]  # type: ignore[attr-defined]
+    except Exception:
+        idx = None
+    if idx is None:
+        st.markdown(
+            "<div class='subpro-quiet'>위 표에서 공고 행을 클릭하면 아래에 상세 패널이 열립니다.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    picked = df.iloc[int(idx)].to_dict()
+    _render_search_detail(db_path, picked, target_win_probability)
+
+
+def _render_search_detail(db_path: str, row: dict, target_win_probability: float) -> None:
+    notice_id = row["notice_id"]
+    agency_name = row.get("agency_name") or ""
+    category = row.get("category") or ""
+    method = row.get("contract_method") or ""
+    base = float(row.get("base_amount") or 0)
+    opened = row.get("opened_at") or "–"
+    region = row.get("region") or "–"
+    floor = row.get("floor_rate")
+
+    has_result = bool(row.get("has_result") and (row.get("bid_rate") or 0) > 0)
+    result_html = (
+        "<div class='subpro-result-highlight subpro-result-won'>"
+        f"✅ 낙찰 완료 · {row.get('winning_company') or '(업체명 없음)'} · "
+        f"{(row.get('award_amount') or 0):,.0f}원 · {row.get('bid_rate'):.2f}%"
+        "</div>"
+    ) if has_result else (
+        "<div class='subpro-result-highlight subpro-result-pending'>"
+        "⏳ 낙찰 결과 아직 없음 (진행 중 또는 DB 미반영)"
+        "</div>"
+    )
+
+    st.markdown(
+        "<div class='subpro-notice-hero'>"
+        "<div class='subpro-notice-hero-top'>"
+        f"<div class='subpro-notice-agency'>{agency_name or '(기관명 없음)'}</div>"
+        f"<div class='subpro-notice-id'>{notice_id}</div>"
+        "</div>"
+        "<div class='subpro-notice-sub'>"
+        f"<span>📅 <b>{opened}</b></span>"
+        f"<span>📂 <b>{_humanize_category(category) or '–'}</b></span>"
+        f"<span>⚖️ <b>{method or '–'}</b></span>"
+        f"<span>📍 <b>{region}</b></span>"
+        "</div>"
+        f"{result_html}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Notice / Result key figures
+    st.markdown(
+        "<div class='subpro-section-title'>공고 기본 정보</div>",
+        unsafe_allow_html=True,
+    )
+    info_cards = [
+        _render_stat_card("예산(추정가)", f"{base:,.0f}", meta="원",
+                           accent="#2563eb"),
+        _render_stat_card("하한율", f"{float(floor):.3f}%" if floor else "미지정",
+                           meta="낙찰 최저율", accent="#7c3aed"),
+        _render_stat_card("기관코드", row.get("agency_code") or "–",
+                           meta="수요기관 식별자", accent="#0891b2"),
+        _render_stat_card("나라장터", "🔗 공고 열기",
+                           meta=f"{_build_g2b_detail_url(notice_id, category)}",
+                           accent="#0f766e"),
+    ]
+    st.markdown(
+        "<div class='subpro-card-grid'>" + "".join(info_cards) + "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"[🔗 나라장터에서 열기]({_build_g2b_detail_url(notice_id, category)})"
+    )
+
+    st.markdown(
+        "<div class='subpro-section-title'>🏆 낙찰 결과</div>",
+        unsafe_allow_html=True,
+    )
+    if has_result:
+        spread = None
+        if base > 0 and (row.get("award_amount") or 0) > 0:
+            spread = base - float(row["award_amount"])
+        result_cards = [
+            _render_stat_card("낙찰업체", row.get("winning_company") or "–",
+                               meta=f"사업자번호 {row.get('winner_biz_no') or '–'}",
+                               accent="#16a34a"),
+            _render_stat_card("낙찰가", f"{(row.get('award_amount') or 0):,.0f}",
+                               meta="원", accent="#0f766e"),
+            _render_stat_card("낙찰률", f"{row['bid_rate']:.2f}%",
+                               meta=("낙찰가/추정가 × 100"), accent="#7c3aed"),
+            _render_stat_card("예산 대비 절감", f"{spread:,.0f}" if spread is not None else "–",
+                               meta="원 (추정가 − 낙찰가)", accent="#ea580c"),
+        ]
+        st.markdown(
+            "<div class='subpro-card-grid'>" + "".join(result_cards) + "</div>",
+            unsafe_allow_html=True,
+        )
+        if row.get("bidder_count"):
+            st.markdown(
+                f"<div class='subpro-quiet'>참여업체 수 (API 반영 시): <b>{row['bidder_count']}</b></div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown(
+            "<div class='subpro-quiet'>아직 낙찰 결과가 DB에 들어오지 않았습니다. "
+            "다음 일일 수집 또는 CSV 임포트 시 자동으로 반영됩니다.</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Demand-agency backtest block
+    st.markdown(
+        "<div class='subpro-section-title'>📈 수요기관 백테스트 <span class='subpro-section-meta'>approved 매핑 기관만</span></div>",
+        unsafe_allow_html=True,
+    )
+    if not agency_name:
+        st.markdown(
+            "<div class='subpro-quiet'>기관명이 없는 공고라 건너뜀.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+    mapping = get_agency_parent(db_path, agency_name)
+    approved = bool(mapping and mapping["status"] == "approved")
+    if not approved:
+        status_label = (mapping["status"] if mapping else "미등록")
+        parent_label = (mapping["parent_name"] if mapping else "–")
+        st.markdown(
+            "<div class='subpro-notice-hero' style='background:linear-gradient(135deg,#fef3c7,#fff7ed);border-color:rgba(217,119,6,0.25);'>"
+            f"<div class='subpro-notice-agency'>🧩 부모 통합 매핑이 `{status_label}` 상태입니다</div>"
+            f"<div class='subpro-notice-sub'>"
+            f"<span>대상: <b>{agency_name}</b></span>"
+            f"<span>부모 후보: <b>{parent_label}</b></span>"
+            "</div>"
+            "<div class='subpro-quiet' style='margin-top:6px;'>🧩 기관 통합 관리 탭에서 승인하면 여기서 "
+            "꺾은선 차트가 표시됩니다.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    with st.spinner(f"`{agency_name}` 백테스트 계산 중..."):
+        df_back = _load_rows_for_agency(db_path, agency_name, category or None, target_win_probability)
+    if df_back.empty:
+        st.warning("백테스트 대상 과거 공고가 없습니다.")
+        return
+    _render_summary(df_back)
+    _render_chart(df_back)
+    _render_table(df_back)
+
+
 def main() -> None:
     st.set_page_config(page_title="G2B 입찰 예측 대시보드", layout="wide")
     _inject_dashboard_styles()
@@ -2074,6 +2686,8 @@ def main() -> None:
         st.stop()
 
     init_db(db_path)
+    db_label = "로컬 수동 DB" if str(Path(db_path)) == "data/bids.db" else "운영 runner DB"
+    st.caption(f"현재 연결 DB: `{db_path}` · {db_label}")
 
     _render_operations_summary_fragment(db_path)
     _render_monitoring_panel(db_path)
@@ -2082,6 +2696,7 @@ def main() -> None:
         "화면",
         options=[
             "📝 진행 중 공고",
+            "🔍 공고 검색",
             "🎯 모의 입찰",
             "🧩 기관 통합 관리",
             "📈 주간 리뷰",
@@ -2092,6 +2707,8 @@ def main() -> None:
 
     if view == "📝 진행 중 공고":
         _render_live_view(db_path, target_win_probability)
+    elif view == "🔍 공고 검색":
+        _render_search_tab(db_path, target_win_probability)
     elif view == "🎯 모의 입찰":
         _render_mock_tab(db_path, target_win_probability)
     elif view == "🧩 기관 통합 관리":

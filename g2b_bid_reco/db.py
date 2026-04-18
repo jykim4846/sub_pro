@@ -152,8 +152,28 @@ CREATE TABLE IF NOT EXISTS automation_runs (
     processed_items INTEGER NOT NULL DEFAULT 0,
     success_items INTEGER NOT NULL DEFAULT 0,
     failed_items INTEGER NOT NULL DEFAULT 0,
+    resumed_items INTEGER NOT NULL DEFAULT 0,
     message TEXT NOT NULL DEFAULT '',
     started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS automation_run_tasks (
+    task_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    contract_method TEXT NOT NULL DEFAULT '',
+    task_seq INTEGER NOT NULL DEFAULT 0,
+    total_items INTEGER NOT NULL DEFAULT 0,
+    processed_items INTEGER NOT NULL DEFAULT 0,
+    success_items INTEGER NOT NULL DEFAULT 0,
+    failed_items INTEGER NOT NULL DEFAULT 0,
+    resumed_items INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'queued',
+    message TEXT NOT NULL DEFAULT '',
+    started_at TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT
 );
@@ -227,7 +247,9 @@ def fail_stale_automation_runs(
         cur = conn.execute(
             """
             UPDATE automation_runs
-            SET status = 'failed',
+            -- Preserve partial progress for resume/monitoring instead of
+            -- collapsing every stale run into a hard failure.
+            SET status = CASE WHEN success_items > 0 THEN 'partial' ELSE 'failed' END,
                 finished_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP,
                 message = CASE
@@ -298,6 +320,13 @@ def init_db(db_path: str | Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_automation_runs_kind_started ON automation_runs(kind, started_at DESC)"
         )
+        _ensure_column(conn, "automation_runs", "resumed_items", "INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_run_tasks_run ON automation_run_tasks(run_id, task_seq)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_run_tasks_status ON automation_run_tasks(status, updated_at DESC)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_notice_prediction_cache_computed_at ON notice_prediction_cache(computed_at DESC)"
         )
@@ -358,19 +387,26 @@ def start_automation_run(
     run_id: str,
     kind: str,
     total_items: int = 0,
+    resumed_items: int = 0,
     message: str = "",
 ) -> None:
     fail_stale_automation_runs(db_path, kind=kind)
+    fail_stale_run_tasks(db_path, kind=kind)
 
     def _action(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             INSERT OR REPLACE INTO automation_runs (
                 run_id, kind, status, total_items, processed_items,
-                success_items, failed_items, message, started_at, updated_at, finished_at
-            ) VALUES (?, ?, 'running', ?, 0, 0, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+                success_items, failed_items, resumed_items, message,
+                started_at, updated_at, finished_at
+            ) VALUES (?, ?, 'running', ?, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
             """,
-            (run_id, kind, max(0, int(total_items)), message),
+            (
+                run_id, kind, max(0, int(total_items)),
+                max(0, int(resumed_items)), max(0, int(resumed_items)),
+                max(0, int(resumed_items)), message,
+            ),
         )
     _run_write_with_retry(db_path, _action)
 
@@ -383,6 +419,7 @@ def update_automation_run(
     success_items: int | None = None,
     failed_items: int | None = None,
     total_items: int | None = None,
+    resumed_items: int | None = None,
     message: str | None = None,
 ) -> None:
     sets: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
@@ -393,6 +430,9 @@ def update_automation_run(
     if success_items is not None:
         sets.append("success_items = ?")
         params.append(max(0, int(success_items)))
+    if resumed_items is not None:
+        sets.append("resumed_items = ?")
+        params.append(max(0, int(resumed_items)))
     if failed_items is not None:
         sets.append("failed_items = ?")
         params.append(max(0, int(failed_items)))
@@ -424,7 +464,9 @@ def finish_automation_run(
     failed_items: int | None = None,
     message: str = "",
 ) -> None:
-    if status not in {"completed", "failed"}:
+    # Run/task state model uses partial/cancelled to distinguish incomplete but
+    # usable results from hard failures.
+    if status not in {"completed", "partial", "failed", "cancelled"}:
         raise ValueError(f"invalid automation run status: {status}")
     sets = [
         "status = ?",
@@ -460,11 +502,25 @@ def get_latest_automation_run(
         return conn.execute(
             """
             SELECT run_id, kind, status, total_items, processed_items,
-                   success_items, failed_items, message,
+                   success_items, failed_items, resumed_items, message,
                    started_at, updated_at, finished_at
             FROM automation_runs
             WHERE kind = ?
-            ORDER BY started_at DESC
+            -- Fresh running rows should win. Once a run is stale, prefer a
+            -- newer completed result, then partial, before falling back to
+            -- stale running/failed rows in the dashboard.
+            ORDER BY CASE
+                         WHEN status = 'running'
+                              AND COALESCE(updated_at, started_at) >= datetime('now', '-3 minutes')
+                         THEN 0
+                         WHEN status = 'completed' THEN 1
+                         WHEN status = 'partial' THEN 2
+                         WHEN status = 'cancelled' THEN 3
+                         WHEN status = 'failed' THEN 4
+                         ELSE 5
+                     END,
+                     COALESCE(updated_at, started_at) DESC,
+                     started_at DESC
             LIMIT 1
             """,
             (kind,),
@@ -499,6 +555,191 @@ def list_latest_automation_runs(
             kinds,
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+TASK_STATUSES_VALID = {"queued", "running", "completed", "partial", "failed", "cancelled"}
+
+
+def create_run_task(
+    db_path: str | Path,
+    *,
+    task_id: str,
+    run_id: str,
+    kind: str,
+    category: str,
+    contract_method: str,
+    task_seq: int,
+    total_items: int,
+    resumed_items: int = 0,
+) -> None:
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO automation_run_tasks (
+                task_id, run_id, kind, category, contract_method, task_seq,
+                total_items, processed_items, success_items, failed_items,
+                resumed_items, status, message, started_at, updated_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, 'queued', '', NULL, CURRENT_TIMESTAMP, NULL)
+            """,
+            (
+                task_id, run_id, kind, category, contract_method,
+                int(task_seq), int(total_items), int(resumed_items),
+            ),
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def start_run_task(db_path: str | Path, *, task_id: str, message: str = "") -> None:
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            UPDATE automation_run_tasks
+            SET status='running',
+                started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP,
+                message = CASE WHEN ?='' THEN message ELSE ? END
+            WHERE task_id = ?
+            """,
+            (message, message, task_id),
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def heartbeat_run_task(
+    db_path: str | Path,
+    *,
+    task_id: str,
+    processed_items: int,
+    success_items: int,
+    failed_items: int,
+    message: str = "",
+) -> None:
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            UPDATE automation_run_tasks
+            SET processed_items = ?,
+                success_items = ?,
+                failed_items = ?,
+                message = CASE WHEN ?='' THEN message ELSE ? END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = ?
+            """,
+            (int(processed_items), int(success_items), int(failed_items),
+             message, message, task_id),
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def finish_run_task(
+    db_path: str | Path,
+    *,
+    task_id: str,
+    status: str,
+    message: str = "",
+    processed_items: int | None = None,
+    success_items: int | None = None,
+    failed_items: int | None = None,
+) -> None:
+    if status not in TASK_STATUSES_VALID:
+        raise ValueError(f"invalid task status: {status}")
+    sets = [
+        "status = ?",
+        "message = CASE WHEN ?='' THEN message ELSE ? END",
+        "finished_at = CURRENT_TIMESTAMP",
+        "updated_at = CURRENT_TIMESTAMP",
+    ]
+    params: list = [status, message, message]
+    if processed_items is not None:
+        sets.append("processed_items = ?")
+        params.append(int(processed_items))
+    if success_items is not None:
+        sets.append("success_items = ?")
+        params.append(int(success_items))
+    if failed_items is not None:
+        sets.append("failed_items = ?")
+        params.append(int(failed_items))
+    params.append(task_id)
+
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            f"UPDATE automation_run_tasks SET {', '.join(sets)} WHERE task_id = ?",
+            params,
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def list_run_tasks(db_path: str | Path, run_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT task_id, run_id, kind, category, contract_method, task_seq,
+                   total_items, processed_items, success_items, failed_items,
+                   resumed_items, status, message,
+                   started_at, updated_at, finished_at
+            FROM automation_run_tasks
+            WHERE run_id = ?
+            ORDER BY task_seq ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def summarize_run_tasks(db_path: str | Path, run_id: str) -> dict:
+    """Aggregated rollup of tasks for the dashboard source-of-truth."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS task_count,
+                   SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_tasks,
+                   SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_tasks,
+                   SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END) AS partial_tasks,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_tasks,
+                   SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued_tasks,
+                   COALESCE(SUM(total_items), 0) AS total_items,
+                   COALESCE(SUM(processed_items), 0) AS processed_items,
+                   COALESCE(SUM(success_items), 0) AS success_items,
+                   COALESCE(SUM(failed_items), 0) AS failed_items,
+                   COALESCE(SUM(resumed_items), 0) AS resumed_items,
+                   MAX(updated_at) AS last_update
+            FROM automation_run_tasks
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    if row is None:
+        return {}
+    return dict(row)
+
+
+def fail_stale_run_tasks(
+    db_path: str | Path,
+    *,
+    kind: str,
+    stale_after_minutes: int = 10,
+    note: str = "stale task closed",
+) -> int:
+    updated = 0
+
+    def _action(conn: sqlite3.Connection) -> None:
+        nonlocal updated
+        cur = conn.execute(
+            """
+            UPDATE automation_run_tasks
+            SET status = CASE WHEN success_items > 0 THEN 'partial' ELSE 'failed' END,
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                message = CASE WHEN message='' THEN ? ELSE message || ' | ' || ? END
+            WHERE kind = ?
+              AND status IN ('running', 'queued')
+              AND updated_at <= datetime('now', ?)
+            """,
+            (note, note, kind, f"-{max(1, stale_after_minutes)} minutes"),
+        )
+        updated = int(cur.rowcount or 0)
+    _run_write_with_retry(db_path, _action)
+    return updated
 
 
 def _run_duration_minutes(run: dict) -> float | None:
@@ -2301,10 +2542,37 @@ def get_operations_summary(
             WHERE stat_date = date('now', 'localtime')
             """
         ).fetchone()
+        # Live counts from mock_bids (including in-flight sim). daily_stats only
+        # gets bumped at the end of a run, so this complements that metric.
+        live_row = conn.execute(
+            """
+            SELECT COUNT(*) AS customer_bids,
+                   COUNT(DISTINCT notice_id) AS notices
+            FROM mock_bids
+            WHERE date(submitted_at, 'localtime') = date('now', 'localtime')
+              AND simulation_id != ''
+            """
+        ).fetchone()
     run_row = get_latest_automation_run(db_path, "auto_bid_pending")
     progress_pct = 0.0
+    live_run_notice_count = 0
+    live_run_customer_bid_count = 0
     if run_row and (run_row["total_items"] or 0) > 0:
         progress_pct = round((run_row["processed_items"] / run_row["total_items"]) * 100.0, 1)
+    if run_row:
+        with connect(db_path) as conn:
+            live_run_row = conn.execute(
+                """
+                SELECT COUNT(*) AS customer_bids,
+                       COUNT(DISTINCT notice_id) AS notices
+                FROM mock_bids
+                WHERE simulation_id = ?
+                """,
+                (str(run_row["run_id"]),),
+            ).fetchone()
+        if live_run_row:
+            live_run_notice_count = int(live_run_row["notices"] or 0)
+            live_run_customer_bid_count = int(live_run_row["customer_bids"] or 0)
     return {
         "pending_total": pending_total,
         "new_today": new_today,
@@ -2318,11 +2586,46 @@ def get_operations_summary(
             if api_row else 0
         ),
         "auto_bid_runs_today": int(api_row["auto_bid_runs"]) if api_row else 0,
-        "auto_bid_notices_today": int(api_row["auto_bid_notices"]) if api_row else 0,
-        "auto_bid_customer_bids_today": int(api_row["auto_bid_customer_bids"]) if api_row else 0,
+        "auto_bid_notices_today": max(
+            int(api_row["auto_bid_notices"]) if api_row else 0,
+            int(live_row["notices"]) if live_row else 0,
+        ),
+        "auto_bid_customer_bids_today": max(
+            int(api_row["auto_bid_customer_bids"]) if api_row else 0,
+            int(live_row["customer_bids"]) if live_row else 0,
+        ),
+        "auto_bid_notices_live_today": int(live_row["notices"]) if live_row else 0,
+        "auto_bid_customer_bids_live_today": int(live_row["customer_bids"]) if live_row else 0,
+        "latest_auto_bid_saved_notices": live_run_notice_count,
+        "latest_auto_bid_saved_customer_bids": live_run_customer_bid_count,
         "latest_auto_bid_run": dict(run_row) if run_row else None,
         "latest_auto_bid_progress_pct": progress_pct,
+        "latest_auto_bid_task_summary": (
+            summarize_run_tasks(db_path, run_row["run_id"]) if run_row else None
+        ),
+        "latest_auto_bid_active_task": _latest_active_task(db_path, run_row["run_id"]) if run_row else None,
+        "latest_auto_bid_new_computed": (
+            max(0, int(run_row["processed_items"]) - int(run_row["resumed_items"] or 0))
+            if run_row else 0
+        ),
     }
+
+
+def _latest_active_task(db_path: str | Path, run_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT task_id, category, contract_method, task_seq,
+                   total_items, processed_items, success_items, failed_items,
+                   status, message, started_at, updated_at
+            FROM automation_run_tasks
+            WHERE run_id = ? AND status = 'running'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def get_monitoring_overview(db_path: str | Path) -> dict:
@@ -2637,6 +2940,51 @@ def get_actual_award(db_path: str | Path, notice_id: str) -> ActualAwardOutcome 
         winning_company=row["winning_company"],
         result_status=row["result_status"],
     )
+
+
+def search_notices(
+    db_path: str | Path,
+    query: str,
+    category: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Search notices by agency_name substring or notice_id substring.
+
+    Returns a list of notice summaries (notice_id, agency_name, category,
+    contract_method, base_amount, opened_at, has_result, winning_company,
+    award_amount, bid_rate). Ordered by opened_at DESC.
+    """
+    text = (query or "").strip()
+    if not text:
+        return []
+    filters = [
+        "(n.agency_name LIKE ? OR n.notice_id LIKE ?)",
+    ]
+    params: list = [f"%{text}%", f"%{text}%"]
+    if category:
+        filters.append("n.category = ?")
+        params.append(category)
+    where_sql = " AND ".join(filters)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT n.notice_id, n.agency_name, n.agency_code, n.category,
+                   n.contract_method, n.region, n.base_amount, n.floor_rate,
+                   n.opened_at,
+                   CASE WHEN r.notice_id IS NOT NULL THEN 1 ELSE 0 END AS has_result,
+                   COALESCE(r.winning_company, '') AS winning_company,
+                   COALESCE(r.winner_biz_no, '') AS winner_biz_no,
+                   r.award_amount, r.bid_rate, r.bidder_count,
+                   COALESCE(r.result_status, '') AS result_status
+            FROM bid_notices n
+            LEFT JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE {where_sql}
+            ORDER BY n.opened_at DESC, n.notice_id DESC
+            LIMIT ?
+            """,
+            params + [int(limit)],
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_notice_snapshot(db_path: str | Path, notice_id: str) -> BidNoticeSnapshot | None:

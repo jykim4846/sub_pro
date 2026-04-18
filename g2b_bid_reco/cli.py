@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 
 from .agency_analysis import AgencyRangeAnalyzer
 from .api import (
@@ -21,20 +25,27 @@ from .csv_import import import_contract_history_csvs
 from .db import (
     bump_automation_daily_stats,
     connect,
+    create_run_task,
     finish_automation_run,
+    finish_run_task,
     get_actual_award,
     get_latest_opened_at,
     get_notice_snapshot,
+    heartbeat_run_task,
     init_db,
     insert_case,
+    list_run_tasks,
     load_cases_for_agencies,
     load_historical_cases,
     load_historical_cases_for_notice,
     load_pending_notices_for_prediction,
     replace_auto_mock_bid_batch,
     resolve_adaptive_agencies,
+    save_mock_bid_batch,
     seed_demand_agencies_from_notices,
     start_automation_run,
+    start_run_task,
+    summarize_run_tasks,
     top_winners_for_scope,
     update_automation_run,
 )
@@ -590,140 +601,455 @@ def _load_cases_adaptive(
     )
 
 
+def _auto_bid_scope_worker(payload: dict) -> dict:
+    """Process a single (category, contract_method) scope.
+
+    Runs in a worker process: opens its own sqlite connection, preloads the
+    scope-wide pool once, then computes prediction + simulation for every
+    notice in the bucket. Returns reports/batch_rows back to the parent.
+    """
+    db_path = payload["db_path"]
+    cat = payload["category"]
+    method = payload["contract_method"]
+    group = payload["notices"]
+    top_k = max(1, int(payload["top_k"]))
+    num_customers = max(1, int(payload["num_customers"]))
+    target_win_prob = float(payload["target_win_probability"])
+    progress_run_id = payload.get("progress_run_id")
+    progress_total_items = int(payload.get("progress_total_items") or 0)
+    progress_initial_processed = int(payload.get("progress_initial_processed") or 0)
+    progress_every = max(1, int(payload.get("progress_every") or 0))
+    task_id = payload.get("task_id")
+    task_heartbeat_every = max(1, int(payload.get("task_heartbeat_every") or 30))
+    if task_id:
+        try:
+            start_run_task(
+                db_path,
+                task_id=task_id,
+                message=f"starting scope={cat}/{method} n={len(group)}",
+            )
+        except Exception:
+            pass  # non-fatal: worker keeps going, status stays queued
+    timings = {
+        "preload_s": 0.0,
+        "case_prep_s": 0.0,
+        "predict_s": 0.0,
+        "simulate_s": 0.0,
+    }
+
+    preload_started = perf_counter()
+    scope_cases = load_historical_cases_for_notice(
+        db_path,
+        notice_id="",
+        cutoff_opened_at=None,
+        category=cat,
+        contract_method=method,
+    )
+    scope_cases.sort(key=lambda c: (c.opened_at or ""))
+    scope_opened = [c.opened_at or "" for c in scope_cases]
+    winners = top_winners_for_scope(
+        db_path,
+        "",
+        cat,
+        method,
+        limit=top_k,
+        base_amount=None,
+    )
+    comps_cached = [
+        CompetitorSpec(
+            biz_no=row["biz_no"],
+            company_name=row["company_name"],
+            historical_rates=row["rates"],
+            wins=row["wins"],
+        )
+        for row in winners
+    ]
+    timings["preload_s"] = perf_counter() - preload_started
+
+    group = sorted(group, key=lambda item: ((item.opened_at or ""), item.notice_id))
+    prior_cases: list = []
+    prior_valid_rates_opened_asc: list[float] = []
+    scope_cursor = 0
+
+    out_reports: list[dict] = []
+    out_batch: list[dict] = []
+    failures = 0
+    local_processed = 0
+    for notice in group:
+        try:
+            case_started = perf_counter()
+            cutoff = notice.opened_at or ""
+            cutoff_idx = bisect.bisect_left(scope_opened, cutoff) if cutoff else len(scope_cases)
+            while scope_cursor < cutoff_idx:
+                case = scope_cases[scope_cursor]
+                prior_cases.append(case)
+                if 0 < case.bid_rate <= 110:
+                    prior_valid_rates_opened_asc.append(case.bid_rate)
+                scope_cursor += 1
+            cases = prior_cases
+            timings["case_prep_s"] += perf_counter() - case_started
+
+            predict_started = perf_counter()
+            analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_prob)
+            prediction = NoticePredictor(analyzer).predict(notice)
+            analysis = prediction.analysis
+            timings["predict_s"] += perf_counter() - predict_started
+
+            simulate_started = perf_counter()
+            report = run_simulation(
+                notice_id=notice.notice_id,
+                base_amount=notice.base_amount,
+                floor_rate=notice.floor_rate,
+                predicted_rate=analysis.blended_rate,
+                lower_rate=analysis.lower_rate,
+                upper_rate=analysis.upper_rate,
+                predicted_amount=analysis.recommended_amount,
+                competitors=comps_cached,
+                historical_cases=cases,
+                n_customers=num_customers,
+                historical_rates_opened_asc=prior_valid_rates_opened_asc,
+            )
+            timings["simulate_s"] += perf_counter() - simulate_started
+            out_reports.append(
+                {
+                    "notice_id": notice.notice_id,
+                    "agency_name": notice.agency_name,
+                    "portfolio_win_rate": round(report.our_win_rate, 4),
+                    "best_customer_idx": report.best_customer_idx,
+                    "market_drift": report.market_drift,
+                    "uncertainty_score": report.uncertainty_score,
+                    "parent_used": "",
+                }
+            )
+            for customer in report.customers:
+                out_batch.append(
+                    {
+                        "notice_id": notice.notice_id,
+                        "bid_amount": customer.amount,
+                        "bid_rate": customer.rate,
+                        "predicted_amount": analysis.recommended_amount,
+                        "predicted_rate": analysis.blended_rate,
+                        "note": (
+                            "auto:trend-aware-quantile"
+                            f";portfolio_win_rate={report.our_win_rate:.3f}"
+                            f";role={customer.role}"
+                            f";uncertainty={report.uncertainty_score:.3f}"
+                        ),
+                        "customer_idx": customer.idx,
+                    }
+                )
+        except Exception as exc:
+            failures += 1
+            out_reports.append(
+                {
+                    "notice_id": notice.notice_id,
+                    "agency_name": notice.agency_name,
+                    "error": f"auto-bid failed: {type(exc).__name__}: {exc}",
+                }
+            )
+        local_processed += 1
+        if task_id and local_processed % task_heartbeat_every == 0:
+            try:
+                heartbeat_run_task(
+                    db_path,
+                    task_id=task_id,
+                    processed_items=local_processed,
+                    success_items=local_processed - failures,
+                    failed_items=failures,
+                    message=f"processing {local_processed}/{len(group)}",
+                )
+            except Exception:
+                pass
+        if progress_run_id and progress_every and local_processed % progress_every == 0:
+            progressed = progress_initial_processed + local_processed
+            update_automation_run(
+                db_path,
+                run_id=progress_run_id,
+                processed_items=progressed,
+                success_items=progressed - failures,
+                failed_items=failures,
+                message=f"processing {progressed}/{progress_total_items} (1x, heartbeat)",
+            )
+    if task_id:
+        try:
+            if len(group) == 0:
+                final_status = "completed"
+            elif failures == 0:
+                final_status = "completed"
+            elif local_processed - failures > 0:
+                final_status = "partial"
+            else:
+                final_status = "failed"
+            finish_run_task(
+                db_path,
+                task_id=task_id,
+                status=final_status,
+                message=(
+                    f"done processed={local_processed} success={local_processed - failures} "
+                    f"failed={failures} preload={timings['preload_s']:.2f}s "
+                    f"predict={timings['predict_s']:.2f}s simulate={timings['simulate_s']:.2f}s"
+                ),
+                processed_items=local_processed,
+                success_items=local_processed - failures,
+                failed_items=failures,
+            )
+        except Exception:
+            pass
+    return {
+        "reports": out_reports,
+        "batch_rows": out_batch,
+        "failures": failures,
+        "scope_key": (cat, method),
+        "processed": len(group),
+        "timings": timings,
+    }
+
+
 def _auto_bid_pending(args: argparse.Namespace) -> dict:
     db_path = args.db_path
     init_db(db_path)
+    target_limit = int(args.limit) if args.limit and args.limit > 0 else 0
+    fetch_limit = max(target_limit * 5, 2500) if target_limit > 0 else 1_000_000
     notices = load_pending_notices_for_prediction(
         db_path=db_path,
         category=args.category,
         agency_name=(args.agency or "").strip() or None,
         since_days=args.since_days if args.since_days and args.since_days > 0 else None,
-        limit=args.limit if args.limit and args.limit > 0 else None,
+        limit=fetch_limit,
     )
+    if target_limit > 0:
+        notices = notices[:target_limit]
+    total_notices = len(notices)
+    notice_ids = [n.notice_id for n in notices if getattr(n, "notice_id", "")]
+    resumed_notice_ids: set[str] = set()
+    if notice_ids:
+        with connect(db_path) as _resume_conn:
+            chunk_size = 800
+            for start in range(0, len(notice_ids), chunk_size):
+                chunk_ids = notice_ids[start : start + chunk_size]
+                placeholders = ",".join("?" for _ in chunk_ids)
+                resumed_rows = _resume_conn.execute(
+                    f"""
+                    SELECT DISTINCT m.notice_id
+                    FROM mock_bids m
+                    WHERE m.note LIKE 'auto:%'
+                      AND m.notice_id IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM bid_results r
+                          WHERE r.notice_id = m.notice_id
+                            AND r.award_amount > 0
+                            AND r.bid_rate > 0
+                      )
+                    """,
+                    chunk_ids,
+                ).fetchall()
+                resumed_notice_ids.update(
+                    str(row[0]) for row in resumed_rows if row and row[0]
+                )
+        if resumed_notice_ids:
+            notices = [n for n in notices if n.notice_id not in resumed_notice_ids]
+
+    # Group by scope so we hit SQLite once per (category, contract_method)
+    # instead of once per notice. This is the main performance win.
+    scope_buckets: dict[tuple[str, str], list] = defaultdict(list)
+    skipped_no_scope: list = []
+    for n in notices:
+        if not n.category or not n.contract_method:
+            skipped_no_scope.append(n)
+            continue
+        scope_buckets[(n.category, n.contract_method)].append(n)
+
+    with connect(db_path) as _parent_conn:
+        approved_parents = {
+            row[0]: row[1]
+            for row in _parent_conn.execute(
+                "SELECT agency_name, parent_name FROM agency_parent_mapping "
+                "WHERE status='approved' AND parent_name != ''"
+            )
+        }
+
     simulation_id = f"auto-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    resumed_count = len(resumed_notice_ids)
     start_automation_run(
         db_path,
         run_id=simulation_id,
         kind="auto_bid_pending",
-        total_items=len(notices),
-        message="starting",
+        total_items=total_notices,
+        resumed_items=resumed_count,
+        message=f"starting (resumed {resumed_count})" if resumed_count else "starting",
     )
     reports: list[dict] = []
     batch_rows: list[dict] = []
     failures = 0
     saved = 0
+    processed = resumed_count
+    FLUSH_EVERY = 2000  # customer bids per flush
+    timing_totals = {
+        "preload_s": 0.0,
+        "case_prep_s": 0.0,
+        "predict_s": 0.0,
+        "simulate_s": 0.0,
+    }
+    started_at = perf_counter()
+
+    # Split oversized scopes into sub-chunks so the worker pool stays balanced.
+    env_chunk_size = os.environ.get("AUTO_BID_CHUNK_SIZE")
     try:
-        for idx, notice in enumerate(notices, start=1):
+        chunk_size = int(env_chunk_size) if env_chunk_size else 250
+    except ValueError:
+        chunk_size = 250
+    CHUNK_SIZE = max(25, chunk_size)
+    tasks: list[dict] = []
+    task_seq = 0
+    task_heartbeat_every = max(10, min(30, CHUNK_SIZE // 4))
+    for (cat, method), group in scope_buckets.items():
+        for start in range(0, len(group), CHUNK_SIZE):
+            task_seq += 1
+            chunk_notices = group[start : start + CHUNK_SIZE]
+            task_id = f"{simulation_id}:t{task_seq:05d}"
             try:
-                cases, parent_used = _load_cases_adaptive(
+                create_run_task(
                     db_path,
-                    notice.notice_id,
-                    notice.agency_name,
-                    notice.category,
-                    notice.contract_method,
-                    notice.opened_at,
+                    task_id=task_id,
+                    run_id=simulation_id,
+                    kind="auto_bid_pending",
+                    category=cat,
+                    contract_method=method,
+                    task_seq=task_seq,
+                    total_items=len(chunk_notices),
+                    resumed_items=0,
                 )
-                analyzer = AgencyRangeAnalyzer(cases, target_win_probability=args.target_win_probability)
-                prediction = NoticePredictor(analyzer).predict(notice)
-                analysis = prediction.analysis
-                winners = top_winners_for_scope(
-                    db_path,
-                    notice.agency_name,
-                    notice.category,
-                    notice.contract_method,
-                    limit=max(1, args.top_k),
-                    base_amount=notice.base_amount,
-                )
-                report = run_simulation(
-                    notice_id=notice.notice_id,
-                    base_amount=notice.base_amount,
-                    floor_rate=notice.floor_rate,
-                    predicted_rate=analysis.blended_rate,
-                    lower_rate=analysis.lower_rate,
-                    upper_rate=analysis.upper_rate,
-                    predicted_amount=analysis.recommended_amount,
-                    competitors=[
-                        CompetitorSpec(
-                            biz_no=row["biz_no"],
-                            company_name=row["company_name"],
-                            historical_rates=row["rates"],
-                            wins=row["wins"],
-                        )
-                        for row in winners
-                    ],
-                    historical_cases=cases,
-                    n_customers=max(1, args.num_customers),
-                )
-                reports.append(
-                    {
-                        "notice_id": notice.notice_id,
-                        "agency_name": notice.agency_name,
-                        "portfolio_win_rate": round(report.our_win_rate, 4),
-                        "best_customer_idx": report.best_customer_idx,
-                        "market_drift": report.market_drift,
-                        "uncertainty_score": report.uncertainty_score,
-                        "parent_used": parent_used,
-                    }
-                )
-                for customer in report.customers:
-                    batch_rows.append(
-                        {
-                            "notice_id": notice.notice_id,
-                            "bid_amount": customer.amount,
-                            "bid_rate": customer.rate,
-                            "predicted_amount": analysis.recommended_amount,
-                            "predicted_rate": analysis.blended_rate,
-                            "note": (
-                                "auto:trend-aware-quantile"
-                                f";portfolio_win_rate={report.our_win_rate:.3f}"
-                                f";role={customer.role}"
-                                f";uncertainty={report.uncertainty_score:.3f}"
-                            ),
-                            "customer_idx": customer.idx,
-                        }
-                    )
             except Exception:
-                failures += 1
-                reports.append(
-                    {
-                        "notice_id": notice.notice_id,
-                        "agency_name": notice.agency_name,
-                        "error": "auto-bid failed",
-                    }
-                )
-            if idx == len(notices) or idx % 10 == 0:
+                pass  # best-effort; worker will still run
+            tasks.append({
+                "db_path": db_path,
+                "category": cat,
+                "contract_method": method,
+                "notices": chunk_notices,
+                "top_k": args.top_k,
+                "num_customers": args.num_customers,
+                "target_win_probability": args.target_win_probability,
+                "approved_parents": approved_parents,
+                "task_id": task_id,
+                "task_heartbeat_every": task_heartbeat_every,
+            })
+
+    env_workers = os.environ.get("AUTO_BID_WORKERS")
+    default_workers = max(2, min(8, (os.cpu_count() or 4)))
+    try:
+        max_workers = int(env_workers) if env_workers else default_workers
+    except ValueError:
+        max_workers = default_workers
+    max_workers = max(1, min(max_workers, len(tasks) or 1))
+    if max_workers == 1 and tasks:
+        running_offset = processed
+        progress_every = max(10, min(50, CHUNK_SIZE // 2))
+        for task in tasks:
+            task["progress_run_id"] = simulation_id
+            task["progress_total_items"] = total_notices
+            task["progress_initial_processed"] = running_offset
+            task["progress_every"] = progress_every
+            running_offset += len(task["notices"])
+
+    try:
+        if max_workers == 1 or len(tasks) <= 1:
+            results_iter = (_auto_bid_scope_worker(task) for task in tasks)
+        else:
+            try:
+                pool = ProcessPoolExecutor(max_workers=max_workers)
+                futures = [pool.submit(_auto_bid_scope_worker, task) for task in tasks]
+                results_iter = (fut.result() for fut in as_completed(futures))
+            except PermissionError:
+                max_workers = 1
+                results_iter = (_auto_bid_scope_worker(task) for task in tasks)
+        try:
+            for result in results_iter:
+                reports.extend(result["reports"])
+                batch_rows.extend(result["batch_rows"])
+                failures += result["failures"]
+                processed += result["processed"]
+                for key, value in (result.get("timings") or {}).items():
+                    timing_totals[key] = timing_totals.get(key, 0.0) + float(value or 0.0)
+                if not args.dry_run and len(batch_rows) >= FLUSH_EVERY:
+                    saved += replace_auto_mock_bid_batch(db_path, simulation_id, batch_rows)
+                    batch_rows = []
+                elapsed = max(perf_counter() - started_at, 0.001)
+                rate = processed / elapsed
                 update_automation_run(
                     db_path,
                     run_id=simulation_id,
-                    processed_items=idx,
-                    success_items=idx - failures,
+                    processed_items=processed,
+                    success_items=processed - failures,
                     failed_items=failures,
-                    message=f"processing {idx}/{len(notices)}",
+                    message=(
+                        f"processing {processed}/{total_notices} ({max_workers}x, {rate:.1f}/s, resumed={resumed_count}) "
+                        f"| preload={timing_totals['preload_s']:.1f}s "
+                        f"cases={timing_totals['case_prep_s']:.1f}s "
+                        f"predict={timing_totals['predict_s']:.1f}s "
+                        f"simulate={timing_totals['simulate_s']:.1f}s"
+                    ),
                 )
+        finally:
+            if max_workers > 1 and len(tasks) > 1:
+                pool.shutdown(wait=False, cancel_futures=False)
+        for notice in skipped_no_scope:
+            processed += 1
+            failures += 1
+            reports.append(
+                {
+                    "notice_id": notice.notice_id,
+                    "agency_name": notice.agency_name,
+                    "error": "missing category or contract_method",
+                }
+            )
         if batch_rows and not args.dry_run:
-            saved = replace_auto_mock_bid_batch(db_path, simulation_id, batch_rows)
+            saved += replace_auto_mock_bid_batch(db_path, simulation_id, batch_rows)
+            batch_rows = []
+        if saved and not args.dry_run:
             bump_automation_daily_stats(
                 db_path,
                 auto_bid_runs=1,
-                auto_bid_notices=len(notices),
+                auto_bid_notices=processed - failures,
                 auto_bid_customer_bids=saved,
             )
+        # Decide final run status based on aggregated success/failure ratio.
+        success = max(0, processed - failures)
+        if processed == 0:
+            final_status = "completed" if total_notices == 0 else "failed"
+        elif failures == 0:
+            final_status = "completed"
+        elif success > 0:
+            final_status = "partial"
+        else:
+            final_status = "failed"
         finish_automation_run(
             db_path,
             run_id=simulation_id,
-            status="completed",
-            processed_items=len(notices),
-            success_items=len(notices) - failures,
+            status=final_status,
+            processed_items=processed,
+            success_items=success,
             failed_items=failures,
-            message=f"saved {saved} customer bids",
+            message=(
+                f"{final_status}: saved {saved} customer bids "
+                f"| resumed={resumed_count} "
+                f"| preload={timing_totals['preload_s']:.1f}s "
+                f"cases={timing_totals['case_prep_s']:.1f}s "
+                f"predict={timing_totals['predict_s']:.1f}s "
+                f"simulate={timing_totals['simulate_s']:.1f}s"
+            ),
         )
     except Exception as exc:
+        success = max(0, processed - failures)
+        # Keep resumed/heartbeat progress on failure so reruns and monitoring
+        # see the true amount of already-usable work.
+        error_status = "partial" if success > 0 else "failed"
         finish_automation_run(
             db_path,
             run_id=simulation_id,
-            status="failed",
-            processed_items=len(reports),
-            success_items=len(reports) - failures,
+            status=error_status,
+            processed_items=processed,
+            success_items=success,
             failed_items=failures or 1,
             message=str(exc),
         )
@@ -731,7 +1057,9 @@ def _auto_bid_pending(args: argparse.Namespace) -> dict:
     return {
         "simulation_id": simulation_id,
         "dry_run": bool(args.dry_run),
-        "notices_seen": len(notices),
+        "notices_seen": total_notices,
+        "notices_resumed": resumed_count,
+        "notices_computed": len(notices),
         "customer_bids_saved": saved,
         "reports": reports,
     }

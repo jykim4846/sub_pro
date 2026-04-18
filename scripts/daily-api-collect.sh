@@ -17,7 +17,7 @@
 #   AUTO_BID_ENABLED   default: 1   (generate/update auto mock-bid portfolios after collection)
 #   AUTO_BID_CUSTOMERS default: 5
 #   AUTO_BID_TOP_K     default: 10
-#   AUTO_BID_LIMIT     default: 0   (0 means all pending notices)
+#   AUTO_BID_LIMIT     default: 500 (set 0 to process all pending; heavy)
 #   AUTO_BID_TARGET_WIN default: 0.75
 #   SYNC_DEMAND_AGENCIES default: 1
 #   G2B_USER_INFO_ENDPOINT optional exact demand-agency operation URL
@@ -49,7 +49,7 @@ fi
 AUTO_BID_ENABLED="${AUTO_BID_ENABLED:-1}"
 AUTO_BID_CUSTOMERS="${AUTO_BID_CUSTOMERS:-5}"
 AUTO_BID_TOP_K="${AUTO_BID_TOP_K:-10}"
-AUTO_BID_LIMIT="${AUTO_BID_LIMIT:-0}"
+AUTO_BID_LIMIT="${AUTO_BID_LIMIT:-500}"
 AUTO_BID_TARGET_WIN="${AUTO_BID_TARGET_WIN:-0.75}"
 SYNC_DEMAND_AGENCIES="${SYNC_DEMAND_AGENCIES:-1}"
 G2B_USER_INFO_ENDPOINT="${G2B_USER_INFO_ENDPOINT:-}"

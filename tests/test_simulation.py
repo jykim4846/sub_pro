@@ -1,8 +1,10 @@
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
+from g2b_bid_reco.cli import _auto_bid_pending
 from g2b_bid_reco.api import PPSCollector, PublicDataPortalClient
 from g2b_bid_reco.db import (
     fail_stale_automation_runs,
@@ -329,6 +331,195 @@ class SimulationStrategyTest(unittest.TestCase):
         endpoint = collector.resolve_demand_agency_endpoint()
         self.assertTrue(endpoint.endswith("getDmndInsttInfo02"))
         self.assertGreaterEqual(len(calls), 2)
+
+    def test_auto_bid_pending_tracks_timing_without_changing_strategy(self) -> None:
+        with connect(self.db_path) as conn:
+            for idx in range(12):
+                insert_case(
+                    conn,
+                    HistoricalBidCase(
+                        notice_id=f"HIST-{idx}",
+                        agency_name="기관A",
+                        category="service",
+                        contract_method="적격심사",
+                        region="seoul",
+                        base_amount=100_000_000.0,
+                        award_amount=88_000_000.0 + idx,
+                        bid_rate=88.0 + (idx * 0.01),
+                        bidder_count=10,
+                        opened_at=f"2025-01-{idx + 1:02d}",
+                    ),
+                )
+            insert_case(
+                conn,
+                HistoricalBidCase(
+                    notice_id="PENDING-1",
+                    agency_name="기관A",
+                    category="service",
+                    contract_method="적격심사",
+                    region="seoul",
+                    base_amount=100_000_000.0,
+                    award_amount=0.0,
+                    bid_rate=0.0,
+                    bidder_count=0,
+                    opened_at="2025-02-01",
+                ),
+            )
+
+        payload = _auto_bid_pending(
+            Namespace(
+                db_path=str(self.db_path),
+                category=None,
+                agency=None,
+                since_days=None,
+                limit=10,
+                top_k=5,
+                num_customers=3,
+                target_win_probability=0.75,
+                dry_run=True,
+            )
+        )
+        self.assertEqual(payload["notices_seen"], 1)
+        row = get_latest_automation_run(self.db_path, "auto_bid_pending")
+        assert row is not None
+        self.assertIn("predict=", row["message"])
+        self.assertIn("simulate=", row["message"])
+
+    def test_auto_bid_pending_preserves_existing_non_auto_rows(self) -> None:
+        with connect(self.db_path) as conn:
+            for idx in range(12):
+                insert_case(
+                    conn,
+                    HistoricalBidCase(
+                        notice_id=f"HIST-R-{idx}",
+                        agency_name="기관A",
+                        category="service",
+                        contract_method="적격심사",
+                        region="seoul",
+                        base_amount=100_000_000.0,
+                        award_amount=88_000_000.0 + idx,
+                        bid_rate=88.0 + (idx * 0.01),
+                        bidder_count=10,
+                        opened_at=f"2025-01-{idx + 1:02d}",
+                    ),
+                )
+            insert_case(
+                conn,
+                HistoricalBidCase(
+                    notice_id="PENDING-REPLACE-1",
+                    agency_name="기관A",
+                    category="service",
+                    contract_method="적격심사",
+                    region="seoul",
+                    base_amount=100_000_000.0,
+                    award_amount=0.0,
+                    bid_rate=0.0,
+                    bidder_count=0,
+                    opened_at="2025-02-01",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO mock_bids (notice_id, bid_amount, bid_rate, note, simulation_id, customer_idx)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("PENDING-REPLACE-1", 87_000_000, 87.0, "manual:old", "manual-old", 1),
+            )
+
+        _auto_bid_pending(
+            Namespace(
+                db_path=str(self.db_path),
+                category=None,
+                agency=None,
+                since_days=None,
+                limit=10,
+                top_k=5,
+                num_customers=3,
+                target_win_probability=0.75,
+                dry_run=False,
+            )
+        )
+        rows = [row for row in list_mock_bids(self.db_path) if row["notice_id"] == "PENDING-REPLACE-1"]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(sum(1 for row in rows if str(row["note"]).startswith("manual:")), 1)
+        self.assertEqual(sum(1 for row in rows if str(row["note"]).startswith("auto:trend-aware-quantile")), 3)
+
+    def test_auto_bid_pending_resumes_existing_pending_auto_notices(self) -> None:
+        with connect(self.db_path) as conn:
+            for idx in range(12):
+                insert_case(
+                    conn,
+                    HistoricalBidCase(
+                        notice_id=f"HIST-S-{idx}",
+                        agency_name="기관A",
+                        category="service",
+                        contract_method="적격심사",
+                        region="seoul",
+                        base_amount=100_000_000.0,
+                        award_amount=88_000_000.0 + idx,
+                        bid_rate=88.0 + (idx * 0.01),
+                        bidder_count=10,
+                        opened_at=f"2025-01-{idx + 1:02d}",
+                    ),
+                )
+            insert_case(
+                conn,
+                HistoricalBidCase(
+                    notice_id="PENDING-RESUME-1",
+                    agency_name="기관A",
+                    category="service",
+                    contract_method="적격심사",
+                    region="seoul",
+                    base_amount=100_000_000.0,
+                    award_amount=0.0,
+                    bid_rate=0.0,
+                    bidder_count=0,
+                    opened_at="2025-02-01",
+                ),
+            )
+            insert_case(
+                conn,
+                HistoricalBidCase(
+                    notice_id="PENDING-RESUME-2",
+                    agency_name="기관A",
+                    category="service",
+                    contract_method="적격심사",
+                    region="seoul",
+                    base_amount=100_000_000.0,
+                    award_amount=0.0,
+                    bid_rate=0.0,
+                    bidder_count=0,
+                    opened_at="2025-02-02",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO mock_bids (notice_id, bid_amount, bid_rate, note, simulation_id, customer_idx)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("PENDING-RESUME-1", 87_000_000, 87.0, "auto:old", "auto-old", 1),
+            )
+
+        payload = _auto_bid_pending(
+            Namespace(
+                db_path=str(self.db_path),
+                category=None,
+                agency=None,
+                since_days=None,
+                limit=10,
+                top_k=5,
+                num_customers=3,
+                target_win_probability=0.75,
+                dry_run=True,
+            )
+        )
+        self.assertEqual(payload["notices_seen"], 2)
+        self.assertEqual(payload["notices_resumed"], 1)
+        self.assertEqual(payload["notices_computed"], 1)
+        row = get_latest_automation_run(self.db_path, "auto_bid_pending")
+        assert row is not None
+        self.assertEqual(row["processed_items"], 2)
+        self.assertEqual(row["success_items"], 2)
 
 
 if __name__ == "__main__":

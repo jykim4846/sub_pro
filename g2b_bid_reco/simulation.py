@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import statistics
 from dataclasses import dataclass
 from datetime import datetime
@@ -102,7 +103,27 @@ def _linspace(start: float, stop: float, count: int) -> list[float]:
 def _trend_adjusted_market_rates(
     historical_cases: list[HistoricalBidCase],
     floor_rate: float | None,
+    historical_rates_opened_asc: list[float] | None = None,
 ) -> tuple[list[float], float | None, float | None, float]:
+    if historical_rates_opened_asc is not None:
+        rates = [rate for rate in reversed(historical_rates_opened_asc) if 0 < rate <= 110]
+        if not rates:
+            return ([], None, None, 0.0)
+        recent_count = min(max(6, len(rates) // 3), len(rates))
+        recent_rates = rates[:recent_count]
+        long_center = _safe_mean(rates)
+        recent_center = _safe_mean(recent_rates)
+        if long_center is None or recent_center is None:
+            return (rates, long_center, _safe_spread(rates), 0.0)
+
+        drift = max(-0.35, min(0.35, recent_center - long_center))
+        adjusted: list[float] = []
+        total = max(1, len(rates) - 1)
+        for idx, rate in enumerate(rates):
+            age_weight = idx / total
+            adjusted.append(_clip(rate + (drift * age_weight), floor_rate))
+        return (adjusted, recent_center, _safe_spread(recent_rates), drift)
+
     if not historical_cases:
         return ([], None, None, 0.0)
     ordered_cases = sorted(
@@ -170,9 +191,10 @@ def generate_customer_bids(
     base_amount: float,
     n_customers: int,
     historical_cases: list[HistoricalBidCase],
+    historical_rates_opened_asc: list[float] | None = None,
 ) -> tuple[list[CustomerBid], float | None, float | None, float, list[float]]:
     market_rates, market_center, market_spread, market_drift = _trend_adjusted_market_rates(
-        historical_cases, floor_rate
+        historical_cases, floor_rate, historical_rates_opened_asc
     )
     if not market_rates:
         market_rates = [predicted_rate]
@@ -217,6 +239,7 @@ def run_simulation(
     competitors: list[CompetitorSpec],
     historical_cases: list[HistoricalBidCase],
     n_customers: int,
+    historical_rates_opened_asc: list[float] | None = None,
 ) -> SimulationReport:
     customers, market_center, market_spread, uncertainty, market_rates = generate_customer_bids(
         predicted_rate=predicted_rate,
@@ -226,6 +249,7 @@ def run_simulation(
         base_amount=base_amount,
         n_customers=n_customers,
         historical_cases=historical_cases,
+        historical_rates_opened_asc=historical_rates_opened_asc,
     )
     if not customers or base_amount <= 0:
         return SimulationReport(
@@ -254,12 +278,13 @@ def run_simulation(
     per_customer_wins = [0] * len(customers)
     winning_rates: list[float] = []
     winning_amounts: list[float] = []
+    customer_rates = [customer.rate for customer in customers]
 
     for competitor_rate in market_rates:
-        eligible = [customer for customer in customers if customer.rate < competitor_rate]
-        if not eligible:
+        winner_idx = bisect.bisect_left(customer_rates, competitor_rate) - 1
+        if winner_idx < 0:
             continue
-        winner = max(eligible, key=lambda customer: customer.rate)
+        winner = customers[winner_idx]
         per_customer_wins[winner.idx - 1] += 1
         winning_rates.append(winner.rate)
         winning_amounts.append(winner.amount)
@@ -276,7 +301,10 @@ def run_simulation(
 
     drift = None
     if market_center is not None:
-        long_center = _safe_mean([case.bid_rate for case in historical_cases if 0 < case.bid_rate <= 110])
+        if historical_rates_opened_asc is not None:
+            long_center = _safe_mean([rate for rate in historical_rates_opened_asc if 0 < rate <= 110])
+        else:
+            long_center = _safe_mean([case.bid_rate for case in historical_cases if 0 < case.bid_rate <= 110])
         if long_center is not None:
             drift = round(market_center - long_center, 4)
 
