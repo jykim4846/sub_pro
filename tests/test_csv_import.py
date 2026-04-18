@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Dict, List
 
 from g2b_bid_reco.csv_import import import_contract_history_csvs
 from g2b_bid_reco.db import connect, init_db
@@ -147,7 +148,7 @@ class ContractCsvImportTest(unittest.TestCase):
         self.assertEqual(notice["agency_code"], "ORG002")
         self.assertEqual(notice["category"], "goods")
 
-    def _write_contract_csv(self, path: Path, rows: list[dict[str, str]]) -> None:
+    def _write_contract_csv(self, path: Path, rows: List[Dict[str, str]]) -> None:
         headers = [
             "조달업무구분",
             "입찰공고번호",

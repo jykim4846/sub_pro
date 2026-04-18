@@ -16,6 +16,8 @@
 - `import-contract-csv`: 내려받은 입찰공고/계약내역 CSV를 대량 적재
 - `backfill-recent-3y`: 최근 36개월을 월 단위로 백필
 - `enrich-stubs`: 낙찰만 연결돼 있고 공고 메타가 비어 있는 stub 행을 `bidNtceNo` 개별 조회로 보강
+- `auto-bid-pending`: 진행 중 공고에 대해 자동 모의 입찰 포트폴리오 생성/저장
+- `sync-demand-agencies`: 나라장터 사용자정보 서비스로 수요기관 마스터 동기화
 - `recommend`: 기관/조건을 직접 넣어 추천 투찰률 계산
 - `agency-range`: 기관 단위 예측 범위 계산
 - `predict-notice`: 저장된 공고번호 기준으로 과거 유사 사례만 써서 예측
@@ -90,7 +92,47 @@ python3 -m g2b_bid_reco.cli collect-recent \
 
 - `--since 20260401` 처럼 직접 지정하면 그 시각 이후만 수집
 - DB가 비어 있으면 `--fallback-days 30`(기본) 만큼 과거를 커버
+- `scripts/daily-api-collect.sh`는 증분 수집 뒤 자동 모의 입찰 포트폴리오까지 함께 갱신
+- `scripts/daily-api-collect.sh`는 증분 수집 뒤 수요기관 마스터 동기화와 자동 모의 입찰 포트폴리오 갱신까지 함께 수행
 - cron/LaunchAgent로 하루 1회 돌리면 사실상 자동 최신 유지
+
+자동 모의 입찰 포트폴리오 생성:
+
+```bash
+python3 -m g2b_bid_reco.cli auto-bid-pending \
+  --db-path data/bids.db \
+  --category service \
+  --num-customers 5 \
+  --top-k 10
+```
+
+- 기본값은 `모든 진행 중 공고`를 읽어 고객별 분산 투찰 포트폴리오를 생성합니다.
+- 기간 제한이 필요하면 `--since-days N`, 건수 제한이 필요하면 `--limit N`을 추가합니다.
+- 기존 pending 자동 입찰(`note LIKE 'auto:%'`)은 같은 공고 기준으로 교체 저장됩니다.
+- 실제 낙찰 결과가 수집되면 `mock_bids` 평가는 자동 반영됩니다.
+
+수요기관 마스터 동기화:
+
+```bash
+G2B_USER_INFO_ENDPOINT='http://apis.data.go.kr/1230000/ao/UsrInfoService02/<operation>' \
+python3 -m g2b_bid_reco.cli sync-demand-agencies \
+  --db-path data/bids.db
+```
+
+- `bid_notices.agency_code`와 연결되는 `demand_agencies` 테이블을 유지합니다.
+- 기본 동작은 알려진 수요기관 조회 후보 operation path를 자동 탐지합니다.
+- 필요하면 `--endpoint` 또는 `G2B_USER_INFO_ENDPOINT`로 강제 지정할 수 있습니다.
+- 후보 목록은 `python3 -m g2b_bid_reco.cli sync-demand-agencies --print-candidates` 로 확인할 수 있습니다.
+
+일일 자동화에서 수요기관 동기화까지 포함:
+
+```bash
+bash scripts/daily-api-collect.sh
+```
+
+- 기본값으로 `SYNC_DEMAND_AGENCIES=1` 이라 수요기관 마스터 동기화가 먼저 실행됩니다.
+- exact operation URL을 알고 있으면 `G2B_USER_INFO_ENDPOINT` 로 강제 지정할 수 있습니다.
+- 기관 동기화 기간을 제한하려면 `DEMAND_AGENCY_SINCE`, `DEMAND_AGENCY_UNTIL` 환경변수를 사용합니다.
 
 최근 3년 백필:
 

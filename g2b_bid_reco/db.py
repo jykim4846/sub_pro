@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 from .models import ActualAwardOutcome, BidNoticeSnapshot, HistoricalBidCase
@@ -16,6 +17,20 @@ CREATE TABLE IF NOT EXISTS procurement_plans (
     planned_quarter TEXT,
     contract_method TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS demand_agencies (
+    agency_code TEXT PRIMARY KEY,
+    agency_name TEXT NOT NULL DEFAULT '',
+    top_agency_code TEXT NOT NULL DEFAULT '',
+    top_agency_name TEXT NOT NULL DEFAULT '',
+    jurisdiction_type TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    road_address TEXT NOT NULL DEFAULT '',
+    postal_code TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'observed',
+    raw_json TEXT NOT NULL DEFAULT '',
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS bid_notices (
@@ -118,23 +133,139 @@ CREATE TABLE IF NOT EXISTS improvement_suggestions (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     note TEXT DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS automation_daily_stats (
+    stat_date TEXT PRIMARY KEY,
+    collect_api_calls INTEGER NOT NULL DEFAULT 0,
+    agency_api_calls INTEGER NOT NULL DEFAULT 0,
+    auto_bid_runs INTEGER NOT NULL DEFAULT 0,
+    auto_bid_notices INTEGER NOT NULL DEFAULT 0,
+    auto_bid_customer_bids INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+    run_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    total_items INTEGER NOT NULL DEFAULT 0,
+    processed_items INTEGER NOT NULL DEFAULT 0,
+    success_items INTEGER NOT NULL DEFAULT 0,
+    failed_items INTEGER NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT '',
+    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notice_prediction_cache (
+    notice_id TEXT PRIMARY KEY REFERENCES bid_notices(notice_id),
+    cache_key TEXT NOT NULL DEFAULT '',
+    target_win_probability REAL NOT NULL DEFAULT 0,
+    predicted_amount REAL,
+    predicted_rate REAL,
+    lower_rate REAL,
+    upper_rate REAL,
+    estimated_win_probability REAL NOT NULL DEFAULT 0,
+    confidence TEXT NOT NULL DEFAULT '',
+    agency_cases INTEGER NOT NULL DEFAULT 0,
+    peer_cases INTEGER NOT NULL DEFAULT 0,
+    lookback_years_used INTEGER,
+    parent_used TEXT NOT NULL DEFAULT '',
+    analysis_notes TEXT NOT NULL DEFAULT '',
+    computed_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+def _run_write_with_retry(
+    db_path: str | Path,
+    action,
+    *,
+    attempts: int = 5,
+    initial_sleep_sec: float = 0.2,
+) -> None:
+    last_exc: sqlite3.OperationalError | None = None
+    for attempt in range(attempts):
+        try:
+            with connect(db_path) as conn:
+                action(conn)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_exc = exc
+            if attempt >= attempts - 1:
+                break
+            time.sleep(initial_sleep_sec * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+
+def fail_stale_automation_runs(
+    db_path: str | Path,
+    *,
+    kind: str,
+    stale_after_minutes: int = 10,
+    note: str = "stale run closed before new start",
+) -> int:
+    updated = 0
+
+    def _action(conn: sqlite3.Connection) -> None:
+        nonlocal updated
+        cur = conn.execute(
+            """
+            UPDATE automation_runs
+            SET status = 'failed',
+                finished_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                message = CASE
+                    WHEN message = '' THEN ?
+                    ELSE message || ' | ' || ?
+                END
+            WHERE kind = ?
+              AND status = 'running'
+              AND updated_at <= datetime('now', ?)
+            """,
+            (note, note, kind, f"-{max(1, stale_after_minutes)} minutes"),
+        )
+        updated = int(cur.rowcount or 0)
+
+    _run_write_with_retry(db_path, _action)
+    return updated
 
 
 def init_db(db_path: str | Path) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_column(conn, "demand_agencies", "top_agency_code", "TEXT DEFAULT ''")
+        _ensure_column(conn, "demand_agencies", "top_agency_name", "TEXT DEFAULT ''")
+        _ensure_column(conn, "demand_agencies", "jurisdiction_type", "TEXT DEFAULT ''")
+        _ensure_column(conn, "demand_agencies", "address", "TEXT DEFAULT ''")
+        _ensure_column(conn, "demand_agencies", "road_address", "TEXT DEFAULT ''")
+        _ensure_column(conn, "demand_agencies", "postal_code", "TEXT DEFAULT ''")
+        _ensure_column(conn, "demand_agencies", "source", "TEXT DEFAULT 'observed'")
+        _ensure_column(conn, "demand_agencies", "raw_json", "TEXT DEFAULT ''")
         _ensure_column(conn, "bid_notices", "agency_code", "TEXT DEFAULT ''")
         _ensure_column(conn, "procurement_plans", "agency_code", "TEXT DEFAULT ''")
         _ensure_column(conn, "bid_results", "winner_biz_no", "TEXT DEFAULT ''")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_demand_agencies_name ON demand_agencies(agency_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_demand_agencies_top ON demand_agencies(top_agency_code)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_notices_cat_method ON bid_notices(category, contract_method)"
         )
@@ -161,6 +292,15 @@ def init_db(db_path: str | Path) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mock_bids_simulation ON mock_bids(simulation_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_daily_stats_updated_at ON automation_daily_stats(updated_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_runs_kind_started ON automation_runs(kind, started_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notice_prediction_cache_computed_at ON notice_prediction_cache(computed_at DESC)"
+        )
 
 
 def _ensure_column(
@@ -170,6 +310,298 @@ def _ensure_column(
     if column in existing:
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {type_decl}")
+
+
+def bump_automation_daily_stats(
+    db_path: str | Path,
+    *,
+    collect_api_calls: int = 0,
+    agency_api_calls: int = 0,
+    auto_bid_runs: int = 0,
+    auto_bid_notices: int = 0,
+    auto_bid_customer_bids: int = 0,
+    stat_date: str | None = None,
+) -> None:
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            INSERT INTO automation_daily_stats (
+                stat_date, collect_api_calls, agency_api_calls,
+                auto_bid_runs, auto_bid_notices, auto_bid_customer_bids,
+                updated_at
+            ) VALUES (
+                COALESCE(?, date('now', 'localtime')), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(stat_date) DO UPDATE SET
+                collect_api_calls = automation_daily_stats.collect_api_calls + excluded.collect_api_calls,
+                agency_api_calls = automation_daily_stats.agency_api_calls + excluded.agency_api_calls,
+                auto_bid_runs = automation_daily_stats.auto_bid_runs + excluded.auto_bid_runs,
+                auto_bid_notices = automation_daily_stats.auto_bid_notices + excluded.auto_bid_notices,
+                auto_bid_customer_bids = automation_daily_stats.auto_bid_customer_bids + excluded.auto_bid_customer_bids,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                stat_date,
+                max(0, int(collect_api_calls)),
+                max(0, int(agency_api_calls)),
+                max(0, int(auto_bid_runs)),
+                max(0, int(auto_bid_notices)),
+                max(0, int(auto_bid_customer_bids)),
+            ),
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def start_automation_run(
+    db_path: str | Path,
+    *,
+    run_id: str,
+    kind: str,
+    total_items: int = 0,
+    message: str = "",
+) -> None:
+    fail_stale_automation_runs(db_path, kind=kind)
+
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO automation_runs (
+                run_id, kind, status, total_items, processed_items,
+                success_items, failed_items, message, started_at, updated_at, finished_at
+            ) VALUES (?, ?, 'running', ?, 0, 0, 0, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+            """,
+            (run_id, kind, max(0, int(total_items)), message),
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def update_automation_run(
+    db_path: str | Path,
+    *,
+    run_id: str,
+    processed_items: int | None = None,
+    success_items: int | None = None,
+    failed_items: int | None = None,
+    total_items: int | None = None,
+    message: str | None = None,
+) -> None:
+    sets: list[str] = ["updated_at = CURRENT_TIMESTAMP"]
+    params: list = []
+    if processed_items is not None:
+        sets.append("processed_items = ?")
+        params.append(max(0, int(processed_items)))
+    if success_items is not None:
+        sets.append("success_items = ?")
+        params.append(max(0, int(success_items)))
+    if failed_items is not None:
+        sets.append("failed_items = ?")
+        params.append(max(0, int(failed_items)))
+    if total_items is not None:
+        sets.append("total_items = ?")
+        params.append(max(0, int(total_items)))
+    if message is not None:
+        sets.append("message = ?")
+        params.append(message)
+    if len(sets) == 1:
+        return
+    params.append(run_id)
+
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            f"UPDATE automation_runs SET {', '.join(sets)} WHERE run_id = ?",
+            params,
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def finish_automation_run(
+    db_path: str | Path,
+    *,
+    run_id: str,
+    status: str,
+    processed_items: int | None = None,
+    success_items: int | None = None,
+    failed_items: int | None = None,
+    message: str = "",
+) -> None:
+    if status not in {"completed", "failed"}:
+        raise ValueError(f"invalid automation run status: {status}")
+    sets = [
+        "status = ?",
+        "updated_at = CURRENT_TIMESTAMP",
+        "finished_at = CURRENT_TIMESTAMP",
+        "message = ?",
+    ]
+    params: list = [status, message]
+    if processed_items is not None:
+        sets.append("processed_items = ?")
+        params.append(max(0, int(processed_items)))
+    if success_items is not None:
+        sets.append("success_items = ?")
+        params.append(max(0, int(success_items)))
+    if failed_items is not None:
+        sets.append("failed_items = ?")
+        params.append(max(0, int(failed_items)))
+    params.append(run_id)
+
+    def _action(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            f"UPDATE automation_runs SET {', '.join(sets)} WHERE run_id = ?",
+            params,
+        )
+    _run_write_with_retry(db_path, _action)
+
+
+def get_latest_automation_run(
+    db_path: str | Path,
+    kind: str,
+) -> sqlite3.Row | None:
+    with connect(db_path) as conn:
+        return conn.execute(
+            """
+            SELECT run_id, kind, status, total_items, processed_items,
+                   success_items, failed_items, message,
+                   started_at, updated_at, finished_at
+            FROM automation_runs
+            WHERE kind = ?
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (kind,),
+        ).fetchone()
+
+
+def list_latest_automation_runs(
+    db_path: str | Path,
+    kinds: list[str],
+) -> list[dict]:
+    if not kinds:
+        return []
+    placeholders = ",".join("?" for _ in kinds)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            WITH ranked AS (
+                SELECT run_id, kind, status, total_items, processed_items,
+                       success_items, failed_items, message,
+                       started_at, updated_at, finished_at,
+                       ROW_NUMBER() OVER (PARTITION BY kind ORDER BY started_at DESC) AS rn
+                FROM automation_runs
+                WHERE kind IN ({placeholders})
+            )
+            SELECT run_id, kind, status, total_items, processed_items,
+                   success_items, failed_items, message,
+                   started_at, updated_at, finished_at
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY kind ASC
+            """,
+            kinds,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _run_duration_minutes(run: dict) -> float | None:
+    started = run.get("started_at")
+    ended = run.get("finished_at") or run.get("updated_at")
+    if not started or not ended:
+        return None
+    with connect(":memory:") as conn:
+        row = conn.execute(
+            "SELECT (julianday(?) - julianday(?)) * 24.0 * 60.0",
+            (ended, started),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
+def _daily_notice_baseline(db_path: str | Path, lookback_days: int = 21) -> float | None:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT date(created_at, 'localtime') AS day, COUNT(*) AS c
+            FROM bid_notices
+            WHERE date(created_at, 'localtime') >= date('now', 'localtime', ?)
+              AND date(created_at, 'localtime') < date('now', 'localtime')
+            GROUP BY day
+            ORDER BY day DESC
+            """,
+            (f"-{max(1, lookback_days)} days",),
+        ).fetchall()
+    counts = [int(row["c"]) for row in rows if row["c"] is not None]
+    if not counts:
+        return None
+    counts.sort()
+    mid = len(counts) // 2
+    if len(counts) % 2:
+        return float(counts[mid])
+    return (counts[mid - 1] + counts[mid]) / 2.0
+
+
+def upsert_demand_agency(
+    conn: sqlite3.Connection,
+    agency_code: str,
+    agency_name: str = "",
+    top_agency_code: str = "",
+    top_agency_name: str = "",
+    jurisdiction_type: str = "",
+    address: str = "",
+    road_address: str = "",
+    postal_code: str = "",
+    source: str = "observed",
+    raw_json: str = "",
+) -> None:
+    code = (agency_code or "").strip()
+    if not code:
+        return
+    conn.execute(
+        """
+        INSERT INTO demand_agencies (
+            agency_code, agency_name, top_agency_code, top_agency_name,
+            jurisdiction_type, address, road_address, postal_code,
+            source, raw_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(agency_code) DO UPDATE SET
+            agency_name = CASE WHEN excluded.agency_name != '' THEN excluded.agency_name ELSE demand_agencies.agency_name END,
+            top_agency_code = CASE WHEN excluded.top_agency_code != '' THEN excluded.top_agency_code ELSE demand_agencies.top_agency_code END,
+            top_agency_name = CASE WHEN excluded.top_agency_name != '' THEN excluded.top_agency_name ELSE demand_agencies.top_agency_name END,
+            jurisdiction_type = CASE WHEN excluded.jurisdiction_type != '' THEN excluded.jurisdiction_type ELSE demand_agencies.jurisdiction_type END,
+            address = CASE WHEN excluded.address != '' THEN excluded.address ELSE demand_agencies.address END,
+            road_address = CASE WHEN excluded.road_address != '' THEN excluded.road_address ELSE demand_agencies.road_address END,
+            postal_code = CASE WHEN excluded.postal_code != '' THEN excluded.postal_code ELSE demand_agencies.postal_code END,
+            source = CASE WHEN excluded.source != '' THEN excluded.source ELSE demand_agencies.source END,
+            raw_json = CASE WHEN excluded.raw_json != '' THEN excluded.raw_json ELSE demand_agencies.raw_json END,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            code,
+            agency_name,
+            top_agency_code,
+            top_agency_name,
+            jurisdiction_type,
+            address,
+            road_address,
+            postal_code,
+            source,
+            raw_json,
+        ),
+    )
+
+
+def seed_demand_agencies_from_notices(conn: sqlite3.Connection) -> int:
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT INTO demand_agencies (agency_code, agency_name, source, updated_at)
+        SELECT agency_code, MAX(agency_name), 'observed', CURRENT_TIMESTAMP
+        FROM bid_notices
+        WHERE agency_code != ''
+        GROUP BY agency_code
+        ON CONFLICT(agency_code) DO UPDATE SET
+            agency_name = CASE WHEN excluded.agency_name != '' THEN excluded.agency_name ELSE demand_agencies.agency_name END,
+            updated_at = CURRENT_TIMESTAMP
+        """
+    )
+    return conn.total_changes - before
 
 
 def insert_case(conn: sqlite3.Connection, case: HistoricalBidCase) -> None:
@@ -233,6 +665,13 @@ def upsert_notice(
     opened_at: str | None,
     agency_code: str = "",
 ) -> None:
+    if agency_code:
+        upsert_demand_agency(
+            conn=conn,
+            agency_code=agency_code,
+            agency_name=agency_name,
+            source="notice",
+        )
     conn.execute(
         """
         INSERT INTO bid_notices (
@@ -295,6 +734,13 @@ def enrich_notice_from_result(
     authoritative data coming from the notices endpoint is never overwritten.
     """
     ensure_notice_stub(conn, notice_id, category=category)
+    if agency_code:
+        upsert_demand_agency(
+            conn=conn,
+            agency_code=agency_code,
+            agency_name=agency_name,
+            source="result",
+        )
     base_value = float(base_amount) if base_amount is not None else 0.0
     conn.execute(
         """
@@ -339,6 +785,13 @@ def enrich_notice_from_detail(
     empty / zero / null.
     """
     ensure_notice_stub(conn, notice_id, category=category)
+    if agency_code:
+        upsert_demand_agency(
+            conn=conn,
+            agency_code=agency_code,
+            agency_name=agency_name,
+            source="notice-detail",
+        )
     base_value = float(base_amount) if base_amount is not None else 0.0
     conn.execute(
         """
@@ -471,7 +924,15 @@ def upsert_procurement_plan(
     budget_amount: float,
     planned_quarter: str,
     contract_method: str,
+    agency_code: str = "",
 ) -> None:
+    if agency_code:
+        upsert_demand_agency(
+            conn=conn,
+            agency_code=agency_code,
+            agency_name=agency_name,
+            source="plan",
+        )
     conn.execute(
         """
         INSERT INTO procurement_plans (
@@ -539,6 +1000,47 @@ def load_historical_cases(db_path: str | Path) -> list[HistoricalBidCase]:
         )
         for row in rows
     ]
+
+
+def get_demand_agency(db_path: str | Path, agency_code: str) -> sqlite3.Row | None:
+    with connect(db_path) as conn:
+        return conn.execute(
+            """
+            SELECT agency_code, agency_name, top_agency_code, top_agency_name,
+                   jurisdiction_type, address, road_address, postal_code,
+                   source, updated_at
+            FROM demand_agencies
+            WHERE agency_code = ?
+            """,
+            (agency_code,),
+        ).fetchone()
+
+
+def list_demand_agencies(
+    db_path: str | Path,
+    search: str | None = None,
+    limit: int = 200,
+) -> list[sqlite3.Row]:
+    filters: list[str] = []
+    params: list = []
+    if search:
+        filters.append("(agency_code LIKE ? OR agency_name LIKE ? OR top_agency_name LIKE ?)")
+        needle = f"%{search}%"
+        params.extend([needle, needle, needle])
+    where_sql = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with connect(db_path) as conn:
+        return conn.execute(
+            f"""
+            SELECT agency_code, agency_name, top_agency_code, top_agency_name,
+                   jurisdiction_type, address, road_address, postal_code,
+                   source, updated_at
+            FROM demand_agencies
+            {where_sql}
+            ORDER BY agency_name ASC, agency_code ASC
+            LIMIT ?
+            """,
+            params + [max(1, limit)],
+        ).fetchall()
 
 
 def load_historical_cases_for_notice(
@@ -818,6 +1320,54 @@ def save_mock_bid_batch(
     if not rows:
         return 0
     with connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
+                predicted_amount, predicted_rate, note, simulation_id,
+                customer_idx, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [
+                (r["notice_id"], r["bid_amount"], r["bid_rate"],
+                 r.get("predicted_amount"), r.get("predicted_rate"),
+                 r.get("note", ""), simulation_id, r.get("customer_idx", 0))
+                for r in rows
+            ],
+        )
+    return len(rows)
+
+
+def replace_auto_mock_bid_batch(
+    db_path: str | Path,
+    simulation_id: str,
+    rows: list[dict],
+) -> int:
+    """Replace pending auto-generated mock bids for the same notices.
+
+    Rows are considered auto-generated when note starts with ``auto:``.
+    Awarded notices are preserved so historical evaluation remains available.
+    """
+    if not rows:
+        return 0
+    notice_ids = sorted({str(row["notice_id"]) for row in rows if row.get("notice_id")})
+    placeholders = ",".join("?" for _ in notice_ids)
+    with connect(db_path) as conn:
+        if notice_ids:
+            conn.execute(
+                f"""
+                DELETE FROM mock_bids
+                WHERE note LIKE 'auto:%'
+                  AND notice_id IN ({placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bid_results r
+                      WHERE r.notice_id = mock_bids.notice_id
+                        AND r.award_amount > 0
+                        AND r.bid_rate > 0
+                  )
+                """,
+                notice_ids,
+            )
         conn.executemany(
             """
             INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
@@ -1420,12 +1970,204 @@ def get_latest_opened_at(db_path: str | Path, category: str | None = None) -> st
     return row["m"] if row else None
 
 
+def _get_prediction_cache_versions(conn: sqlite3.Connection) -> tuple[str, str]:
+    notice_row = conn.execute(
+        """
+        SELECT COALESCE(MAX(created_at), '') AS max_created_at,
+               COUNT(*) AS total_count
+        FROM bid_notices
+        """
+    ).fetchone()
+    result_row = conn.execute(
+        """
+        SELECT COALESCE(MAX(created_at), '') AS max_created_at,
+               COUNT(*) AS total_count
+        FROM bid_results
+        """
+    ).fetchone()
+    notice_version = f"{notice_row['max_created_at']}|{notice_row['total_count']}"
+    result_version = f"{result_row['max_created_at']}|{result_row['total_count']}"
+    return str(notice_version), str(result_version)
+
+
+def _build_notice_prediction_cache_key(
+    notice: BidNoticeSnapshot,
+    target_win_probability: float,
+    notice_version: str,
+    result_version: str,
+) -> str:
+    parts = [
+        notice.notice_id,
+        notice.agency_name or "",
+        notice.category or "",
+        notice.contract_method or "",
+        notice.region or "",
+        f"{float(notice.base_amount or 0):.3f}",
+        "" if notice.floor_rate is None else f"{float(notice.floor_rate):.6f}",
+        notice.opened_at or "",
+        f"{float(target_win_probability):.6f}",
+        notice_version,
+        result_version,
+    ]
+    return "|".join(parts)
+
+
+def get_cached_notice_prediction(
+    db_path: str | Path,
+    notice: BidNoticeSnapshot,
+    target_win_probability: float,
+) -> dict | None:
+    with connect(db_path) as conn:
+        notice_version, result_version = _get_prediction_cache_versions(conn)
+        expected_key = _build_notice_prediction_cache_key(
+            notice, target_win_probability, notice_version, result_version,
+        )
+        row = conn.execute(
+            "SELECT * FROM notice_prediction_cache WHERE notice_id = ?",
+            (notice.notice_id,),
+        ).fetchone()
+    if row is None or row["cache_key"] != expected_key:
+        return None
+    return dict(row)
+
+
+def upsert_notice_prediction_cache(
+    db_path: str | Path,
+    notice: BidNoticeSnapshot,
+    target_win_probability: float,
+    *,
+    predicted_amount: float | None,
+    predicted_rate: float | None,
+    lower_rate: float | None,
+    upper_rate: float | None,
+    estimated_win_probability: float,
+    confidence: str,
+    agency_cases: int,
+    peer_cases: int,
+    lookback_years_used: int | None,
+    parent_used: str | None = None,
+    analysis_notes: str = "",
+) -> None:
+    with connect(db_path) as conn:
+        notice_version, result_version = _get_prediction_cache_versions(conn)
+        cache_key = _build_notice_prediction_cache_key(
+            notice, target_win_probability, notice_version, result_version,
+        )
+        conn.execute(
+            """
+            INSERT INTO notice_prediction_cache (
+                notice_id, cache_key, target_win_probability,
+                predicted_amount, predicted_rate, lower_rate, upper_rate,
+                estimated_win_probability, confidence,
+                agency_cases, peer_cases, lookback_years_used,
+                parent_used, analysis_notes, computed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(notice_id) DO UPDATE SET
+                cache_key = excluded.cache_key,
+                target_win_probability = excluded.target_win_probability,
+                predicted_amount = excluded.predicted_amount,
+                predicted_rate = excluded.predicted_rate,
+                lower_rate = excluded.lower_rate,
+                upper_rate = excluded.upper_rate,
+                estimated_win_probability = excluded.estimated_win_probability,
+                confidence = excluded.confidence,
+                agency_cases = excluded.agency_cases,
+                peer_cases = excluded.peer_cases,
+                lookback_years_used = excluded.lookback_years_used,
+                parent_used = excluded.parent_used,
+                analysis_notes = excluded.analysis_notes,
+                computed_at = CURRENT_TIMESTAMP
+            """,
+            (
+                notice.notice_id,
+                cache_key,
+                target_win_probability,
+                predicted_amount,
+                predicted_rate,
+                lower_rate,
+                upper_rate,
+                estimated_win_probability,
+                confidence,
+                agency_cases,
+                peer_cases,
+                lookback_years_used,
+                parent_used or "",
+                analysis_notes,
+            ),
+        )
+
+
+def list_pending_notice_prediction_rows(
+    db_path: str | Path,
+    *,
+    target_win_probability: float,
+    category: str | None = None,
+    agency_name: str | None = None,
+    since_days: int | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    notices = load_pending_notices_for_prediction(
+        db_path=db_path,
+        category=category,
+        agency_name=agency_name,
+        since_days=since_days,
+        limit=limit,
+    )
+    if not notices:
+        return []
+
+    cache_map: dict[str, sqlite3.Row] = {}
+    with connect(db_path) as conn:
+        notice_version, result_version = _get_prediction_cache_versions(conn)
+        placeholders = ",".join("?" for _ in notices)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM notice_prediction_cache
+            WHERE notice_id IN ({placeholders})
+            """,
+            [notice.notice_id for notice in notices],
+        ).fetchall()
+        cache_map = {str(row["notice_id"]): row for row in rows}
+
+    pending_rows: list[dict] = []
+    for notice in notices:
+        cached = cache_map.get(notice.notice_id)
+        expected_key = _build_notice_prediction_cache_key(
+            notice, target_win_probability, notice_version, result_version,
+        )
+        cache_ready = cached is not None and cached["cache_key"] == expected_key
+        cache_status = "ready" if cache_ready else ("stale" if cached else "missing")
+        pending_rows.append(
+            {
+                "opened_at": notice.opened_at,
+                "notice_id": notice.notice_id,
+                "category": notice.category,
+                "agency_name": notice.agency_name,
+                "contract_method": notice.contract_method,
+                "region": notice.region,
+                "base_amount": notice.base_amount,
+                "floor_rate": notice.floor_rate,
+                "cache_status": cache_status,
+                "cached_at": cached["computed_at"] if cache_ready else None,
+                "predicted_amount": cached["predicted_amount"] if cache_ready else None,
+                "predicted_rate": cached["predicted_rate"] if cache_ready else None,
+                "estimated_win_probability": (
+                    cached["estimated_win_probability"] if cache_ready else None
+                ),
+                "confidence": cached["confidence"] if cache_ready else "",
+                "agency_cases": int(cached["agency_cases"]) if cache_ready else 0,
+                "peer_cases": int(cached["peer_cases"]) if cache_ready else 0,
+            }
+        )
+    return pending_rows
+
+
 def load_pending_notices_for_prediction(
     db_path: str | Path,
     category: str | None = None,
     agency_name: str | None = None,
-    since_days: int = 180,
-    limit: int = 500,
+    since_days: int | None = None,
+    limit: int | None = None,
 ) -> list[BidNoticeSnapshot]:
     """Notices that have predictor-ready metadata but no linked award yet."""
     filters = [
@@ -1433,10 +2175,12 @@ def load_pending_notices_for_prediction(
         "n.contract_method != ''",
         "n.base_amount > 0",
         "COALESCE(n.opened_at, '') != ''",
-        "n.opened_at >= date('now', ?)",
         "(r.notice_id IS NULL OR r.bid_rate <= 0)",
     ]
-    params: list = [f"-{max(1, since_days)} days"]
+    params: list = []
+    if since_days is not None and since_days > 0:
+        filters.append("n.opened_at >= date('now', ?)")
+        params.append(f"-{since_days} days")
     if category:
         filters.append("n.category = ?")
         params.append(category)
@@ -1454,10 +2198,11 @@ def load_pending_notices_for_prediction(
             LEFT JOIN bid_results r ON r.notice_id = n.notice_id
             WHERE {where_sql}
             ORDER BY n.opened_at DESC, n.notice_id DESC
-            LIMIT ?
             """,
-            params + [limit],
+            params,
         ).fetchall()
+    if limit is not None and limit > 0:
+        rows = rows[:limit]
 
     return [
         BidNoticeSnapshot(
@@ -1472,6 +2217,264 @@ def load_pending_notices_for_prediction(
         )
         for row in rows
     ]
+
+
+def get_operations_summary(
+    db_path: str | Path,
+    category: str | None = None,
+) -> dict:
+    """Realtime operating summary for dashboard monitoring."""
+    filters = [
+        "n.agency_name != ''",
+        "n.contract_method != ''",
+        "n.base_amount > 0",
+        "COALESCE(n.opened_at, '') != ''",
+    ]
+    params: list = []
+    if category:
+        filters.append("n.category = ?")
+        params.append(category)
+    where_sql = " AND ".join(filters)
+
+    with connect(db_path) as conn:
+        pending_total = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM bid_notices n
+            LEFT JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE {where_sql}
+              AND (r.notice_id IS NULL OR r.bid_rate <= 0)
+            """,
+            params,
+        ).fetchone()[0]
+        new_today = conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM bid_notices n
+            WHERE {where_sql}
+              AND date(n.created_at, 'localtime') = date('now', 'localtime')
+            """,
+            params,
+        ).fetchone()[0]
+        completed_today = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT n.notice_id)
+            FROM bid_notices n
+            JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE {where_sql}
+              AND r.award_amount > 0
+              AND r.bid_rate > 0
+              AND date(r.created_at, 'localtime') = date('now', 'localtime')
+            """,
+            params,
+        ).fetchone()[0]
+        evaluated_today = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT m.notice_id)
+            FROM mock_bids m
+            JOIN bid_notices n ON n.notice_id = m.notice_id
+            JOIN bid_results r ON r.notice_id = m.notice_id
+            WHERE {where_sql}
+              AND r.award_amount > 0
+              AND r.bid_rate > 0
+              AND date(r.created_at, 'localtime') = date('now', 'localtime')
+            """,
+            params,
+        ).fetchone()[0]
+        auto_covered = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT m.notice_id)
+            FROM mock_bids m
+            JOIN bid_notices n ON n.notice_id = m.notice_id
+            LEFT JOIN bid_results r ON r.notice_id = n.notice_id
+            WHERE {where_sql}
+              AND m.note LIKE 'auto:%'
+              AND (r.notice_id IS NULL OR r.bid_rate <= 0)
+            """,
+            params,
+        ).fetchone()[0]
+        api_row = conn.execute(
+            """
+            SELECT collect_api_calls, agency_api_calls, auto_bid_runs,
+                   auto_bid_notices, auto_bid_customer_bids
+            FROM automation_daily_stats
+            WHERE stat_date = date('now', 'localtime')
+            """
+        ).fetchone()
+    run_row = get_latest_automation_run(db_path, "auto_bid_pending")
+    progress_pct = 0.0
+    if run_row and (run_row["total_items"] or 0) > 0:
+        progress_pct = round((run_row["processed_items"] / run_row["total_items"]) * 100.0, 1)
+    return {
+        "pending_total": pending_total,
+        "new_today": new_today,
+        "completed_today": completed_today,
+        "evaluated_today": evaluated_today,
+        "auto_covered_pending": auto_covered,
+        "collect_api_calls_today": int(api_row["collect_api_calls"]) if api_row else 0,
+        "agency_api_calls_today": int(api_row["agency_api_calls"]) if api_row else 0,
+        "total_api_calls_today": (
+            int(api_row["collect_api_calls"]) + int(api_row["agency_api_calls"])
+            if api_row else 0
+        ),
+        "auto_bid_runs_today": int(api_row["auto_bid_runs"]) if api_row else 0,
+        "auto_bid_notices_today": int(api_row["auto_bid_notices"]) if api_row else 0,
+        "auto_bid_customer_bids_today": int(api_row["auto_bid_customer_bids"]) if api_row else 0,
+        "latest_auto_bid_run": dict(run_row) if run_row else None,
+        "latest_auto_bid_progress_pct": progress_pct,
+    }
+
+
+def get_monitoring_overview(db_path: str | Path) -> dict:
+    categories = ["service", "goods", "construction"]
+    freshness: list[dict] = []
+    with connect(db_path) as conn:
+        for category in categories:
+            row = conn.execute(
+                """
+                SELECT
+                    MAX(opened_at) AS latest_opened_at,
+                    MAX(created_at) AS latest_ingested_at
+                FROM bid_notices
+                WHERE category = ?
+                """,
+                (category,),
+            ).fetchone()
+            freshness.append(
+                {
+                    "category": category,
+                    "latest_opened_at": row["latest_opened_at"] if row else None,
+                    "latest_ingested_at": row["latest_ingested_at"] if row else None,
+                }
+            )
+        unresolved_results = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM bid_results r
+            LEFT JOIN mock_bids m ON m.notice_id = r.notice_id
+            WHERE r.award_amount > 0
+              AND r.bid_rate > 0
+              AND date(r.created_at, 'localtime') = date('now', 'localtime')
+              AND m.notice_id IS NULL
+            """
+        ).fetchone()[0]
+    runs = list_latest_automation_runs(
+        db_path,
+        [
+            "collect_recent:service",
+            "collect_recent:goods",
+            "collect_recent:construction",
+            "sync_demand_agencies",
+            "auto_bid_pending",
+        ],
+    )
+    return {
+        "freshness": freshness,
+        "latest_runs": runs,
+        "unresolved_results_today": unresolved_results,
+    }
+
+
+def get_monitoring_alerts(db_path: str | Path) -> list[dict]:
+    alerts: list[dict] = []
+    overview = get_monitoring_overview(db_path)
+    summary = get_operations_summary(db_path)
+
+    for item in overview["freshness"]:
+        if not item["latest_opened_at"]:
+            alerts.append(
+                {
+                    "severity": "high",
+                    "title": f"{item['category']} 데이터 없음",
+                    "detail": "해당 카테고리에 적재된 공고가 없습니다.",
+                }
+            )
+
+    for run in overview["latest_runs"]:
+        status = run.get("status")
+        kind = run.get("kind")
+        duration_min = _run_duration_minutes(run)
+        if status == "failed":
+            alerts.append(
+                {
+                    "severity": "high",
+                    "title": f"{kind} 최근 실행 실패",
+                    "detail": run.get("message") or "최근 배치가 실패했습니다.",
+                }
+            )
+        elif status == "running":
+            total = int(run.get("total_items") or 0)
+            processed = int(run.get("processed_items") or 0)
+            if total > 0 and processed < total:
+                alerts.append(
+                    {
+                        "severity": "medium",
+                        "title": f"{kind} 실행 중",
+                        "detail": f"{processed}/{total} 처리 완료",
+                    }
+                )
+            runtime_limit = 30.0 if kind == "auto_bid_pending" else 10.0
+            if duration_min is not None and duration_min > runtime_limit:
+                alerts.append(
+                    {
+                        "severity": "medium",
+                        "title": f"{kind} 장시간 실행",
+                        "detail": f"{duration_min:.1f}분째 실행 중입니다. 임계치 {runtime_limit:.0f}분 초과.",
+                    }
+                )
+        elif status == "completed":
+            runtime_limit = 30.0 if kind == "auto_bid_pending" else 10.0
+            if duration_min is not None and duration_min > runtime_limit:
+                alerts.append(
+                    {
+                        "severity": "low",
+                        "title": f"{kind} 소요시간 증가",
+                        "detail": f"최근 배치가 {duration_min:.1f}분 소요됐습니다. 임계치 {runtime_limit:.0f}분 초과.",
+                    }
+                )
+
+    pending_total = int(summary["pending_total"])
+    auto_covered = int(summary["auto_covered_pending"])
+    if pending_total > 0 and auto_covered < pending_total:
+        gap = pending_total - auto_covered
+        alerts.append(
+            {
+                "severity": "medium",
+                "title": "자동입찰 미커버 공고 존재",
+                "detail": f"진행 중 {pending_total}건 중 {gap}건이 아직 자동입찰 미커버 상태입니다.",
+            }
+        )
+
+    if overview["unresolved_results_today"] > 0:
+        alerts.append(
+            {
+                "severity": "medium",
+                "title": "오늘 낙찰 결과 미평가 공고 존재",
+                "detail": f"오늘 결과가 들어온 공고 중 {overview['unresolved_results_today']}건은 mock_bids가 없어 평가되지 않습니다.",
+            }
+        )
+
+    if summary["collect_api_calls_today"] == 0:
+        alerts.append(
+            {
+                "severity": "medium",
+                "title": "오늘 수집 API 호출 없음",
+                "detail": "일일 증분 수집이 아직 돌지 않았거나 실패했을 수 있습니다.",
+            }
+        )
+
+    baseline = _daily_notice_baseline(db_path)
+    today_new = int(summary["new_today"])
+    if baseline is not None and baseline >= 5 and today_new < max(1, baseline * 0.25):
+        alerts.append(
+            {
+                "severity": "medium",
+                "title": "오늘 신규 입수 건수 급감",
+                "detail": f"오늘 신규 입수 {today_new}건으로 최근 기준치 {baseline:.0f}건 대비 낮습니다.",
+            }
+        )
+
+    return alerts
 
 
 def list_agencies_with_backtestable_notices(

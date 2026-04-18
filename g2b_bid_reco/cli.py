@@ -2,28 +2,47 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from .agency_analysis import AgencyRangeAnalyzer
-from .api import PPSCollector, PublicDataPortalClient, build_collect_query, service_key_from_env
+from .api import (
+    PPSCollector,
+    PPS_USER_INFO_BASE_URL,
+    PPS_USER_INFO_DEMAND_AGENCY_CANDIDATES,
+    PublicDataPortalClient,
+    build_collect_query,
+    service_key_from_env,
+)
 from .backtest import build_backtest_report, run_batch_backtest
 from .csv_import import import_contract_history_csvs
 from .db import (
+    bump_automation_daily_stats,
     connect,
+    finish_automation_run,
     get_actual_award,
     get_latest_opened_at,
     get_notice_snapshot,
     init_db,
     insert_case,
+    load_cases_for_agencies,
     load_historical_cases,
     load_historical_cases_for_notice,
+    load_pending_notices_for_prediction,
+    replace_auto_mock_bid_batch,
+    resolve_adaptive_agencies,
+    seed_demand_agencies_from_notices,
+    start_automation_run,
+    top_winners_for_scope,
+    update_automation_run,
 )
 from .models import AgencyRangeRequest, BidRecommendationRequest
 from .notice_prediction import NoticePredictor
 from .recommender import BidRecommender
 from .sample_data import SAMPLE_CASES
+from .simulation import CompetitorSpec, run_simulation
 
 
 DEFAULT_DB_PATH = "data/bids.db"
@@ -155,6 +174,41 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_parser.add_argument("--inqry-div", default="1")
     backfill_parser.add_argument("--end")
 
+    auto_bid_parser = subparsers.add_parser(
+        "auto-bid-pending",
+        help="Generate and save automatic mock-bid portfolios for pending notices.",
+    )
+    auto_bid_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    auto_bid_parser.add_argument("--category", choices=["goods", "service", "construction"])
+    auto_bid_parser.add_argument("--agency")
+    auto_bid_parser.add_argument("--since-days", type=int)
+    auto_bid_parser.add_argument("--limit", type=int, default=0)
+    auto_bid_parser.add_argument("--num-customers", type=int, default=5)
+    auto_bid_parser.add_argument("--top-k", type=int, default=10)
+    auto_bid_parser.add_argument("--target-win-probability", type=float, default=0.75)
+    auto_bid_parser.add_argument("--dry-run", action="store_true")
+
+    sync_agency_parser = subparsers.add_parser(
+        "sync-demand-agencies",
+        help="Sync demand-agency master data from the Nara Market user information service.",
+    )
+    sync_agency_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    sync_agency_parser.add_argument("--service-key")
+    sync_agency_parser.add_argument(
+        "--endpoint",
+        help=(
+            "User-info operation URL under the confirmed base "
+            f"{PPS_USER_INFO_BASE_URL}. If omitted, auto-probes known demand-agency candidates "
+            "or uses G2B_USER_INFO_ENDPOINT when set."
+        ),
+    )
+    sync_agency_parser.add_argument("--page-size", type=int, default=100)
+    sync_agency_parser.add_argument("--max-pages", type=int, default=20)
+    sync_agency_parser.add_argument("--inqry-div", default="1")
+    sync_agency_parser.add_argument("--since")
+    sync_agency_parser.add_argument("--until")
+    sync_agency_parser.add_argument("--print-candidates", action="store_true")
+
     return parser
 
 
@@ -277,6 +331,13 @@ def main() -> int:
         if not service_key:
             raise SystemExit("Missing service key. Pass --service-key or set DATA_GO_KR_SERVICE_KEY.")
         init_db(args.db_path)
+        run_id = f"collect-{args.category}-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+        start_automation_run(
+            args.db_path,
+            run_id=run_id,
+            kind=f"collect_recent:{args.category}",
+            message="starting",
+        )
         client = PublicDataPortalClient(
             service_key=service_key,
             per_call_sleep_sec=max(0.0, args.sleep_sec),
@@ -284,17 +345,39 @@ def main() -> int:
         collector = PPSCollector(client=client, db_path=args.db_path)
         sources = [source.strip() for source in args.sources.split(",") if source.strip()]
         start_dt = _resolve_collect_recent_start(args)
-        result = collector.collect_between(
-            category=args.category,
-            sources=sources,
-            start=start_dt,
-            page_size=args.page_size,
-            max_pages_per_window=args.max_pages_per_window,
-            inqry_div=args.inqry_div,
-        )
-        payload = {"since": start_dt.strftime("%Y-%m-%d %H:%M"), **asdict(result)}
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+        try:
+            result = collector.collect_between(
+                category=args.category,
+                sources=sources,
+                start=start_dt,
+                page_size=args.page_size,
+                max_pages_per_window=args.max_pages_per_window,
+                inqry_div=args.inqry_div,
+            )
+            bump_automation_daily_stats(
+                args.db_path,
+                collect_api_calls=result.total_pages_fetched,
+            )
+            finish_automation_run(
+                args.db_path,
+                run_id=run_id,
+                status="completed",
+                processed_items=result.total_items_seen,
+                success_items=result.total_items_upserted,
+                failed_items=max(0, result.total_items_seen - result.total_items_upserted),
+                message=f"pages={result.total_pages_fetched}",
+            )
+            payload = {"since": start_dt.strftime("%Y-%m-%d %H:%M"), **asdict(result)}
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        except Exception as exc:
+            finish_automation_run(
+                args.db_path,
+                run_id=run_id,
+                status="failed",
+                message=str(exc),
+            )
+            raise
 
     if args.command == "backfill-recent-3y":
         service_key = args.service_key or service_key_from_env()
@@ -316,6 +399,74 @@ def main() -> int:
         )
         print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
         return 0
+
+    if args.command == "auto-bid-pending":
+        payload = _auto_bid_pending(args)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "sync-demand-agencies":
+        if args.print_candidates:
+            print(json.dumps({"candidates": list(PPS_USER_INFO_DEMAND_AGENCY_CANDIDATES)}, ensure_ascii=False, indent=2))
+            return 0
+        service_key = args.service_key or service_key_from_env()
+        if not service_key:
+            raise SystemExit("Missing service key. Pass --service-key or set DATA_GO_KR_SERVICE_KEY.")
+        init_db(args.db_path)
+        run_id = f"sync-demand-agencies-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+        start_automation_run(
+            args.db_path,
+            run_id=run_id,
+            kind="sync_demand_agencies",
+            message="starting",
+        )
+        client = PublicDataPortalClient(service_key=service_key)
+        collector = PPSCollector(client=client, db_path=args.db_path)
+        endpoint = collector.resolve_demand_agency_endpoint(
+            endpoint=args.endpoint or os.environ.get("G2B_USER_INFO_ENDPOINT")
+        )
+        with connect(args.db_path) as conn:
+            seeded = seed_demand_agencies_from_notices(conn)
+        query = {
+            "pageNo": 1,
+            "numOfRows": args.page_size,
+            "inqryDiv": args.inqry_div,
+            "type": "json",
+        }
+        if args.since:
+            query["inqryBgnDt"] = _parse_cli_datetime_text(args.since).strftime("%Y%m%d%H%M")
+        if args.until:
+            query["inqryEndDt"] = _parse_cli_datetime_text(args.until).strftime("%Y%m%d%H%M")
+        try:
+            result = collector.sync_demand_agencies(
+                endpoint=endpoint,
+                query=query,
+                max_pages=args.max_pages,
+            )
+            bump_automation_daily_stats(
+                args.db_path,
+                agency_api_calls=result.pages_fetched,
+            )
+            finish_automation_run(
+                args.db_path,
+                run_id=run_id,
+                status="completed",
+                processed_items=result.items_seen,
+                success_items=result.items_upserted,
+                failed_items=max(0, result.items_seen - result.items_upserted),
+                message=f"pages={result.pages_fetched}",
+            )
+            payload = {"seeded_from_notices": seeded, **asdict(result), "endpoint": endpoint}
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        except Exception as exc:
+            finish_automation_run(
+                args.db_path,
+                run_id=run_id,
+                status="failed",
+                message=str(exc),
+            )
+            raise
 
     parser.error("Unknown command")
     return 2
@@ -363,15 +514,19 @@ def _agency_range_from_args(args: argparse.Namespace):
     return AgencyRangeAnalyzer(cases).analyze(request)
 
 
+def _parse_cli_datetime_text(text: str) -> datetime:
+    value = text.strip()
+    for fmt in ("%Y%m%d%H%M", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    raise SystemExit(f"Unparseable datetime value: {text}")
+
+
 def _resolve_collect_recent_start(args: argparse.Namespace) -> datetime:
     if args.since:
-        text = args.since.strip()
-        for fmt in ("%Y%m%d%H%M", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(text, fmt)
-            except ValueError:
-                continue
-        raise SystemExit(f"Unparseable --since value: {args.since}")
+        return _parse_cli_datetime_text(args.since)
 
     latest = get_latest_opened_at(args.db_path, args.category)
     if latest:
@@ -386,6 +541,200 @@ def _resolve_collect_recent_start(args: argparse.Namespace) -> datetime:
 
 def _predict_notice_from_args(args: argparse.Namespace):
     return _predict_notice(args.db_path, args.notice_id)
+
+
+def _load_cases_adaptive(
+    db_path: str,
+    notice_id: str,
+    agency_name: str,
+    category: str,
+    contract_method: str,
+    opened_at: str | None,
+) -> tuple[list, str | None]:
+    agency_list, parent_used = resolve_adaptive_agencies(
+        db_path,
+        agency_name,
+        category=category,
+        contract_method=contract_method,
+    )
+    if parent_used:
+        cases = load_cases_for_agencies(
+            db_path,
+            agency_list,
+            category=category,
+            contract_method=contract_method,
+            cutoff_opened_at=opened_at,
+            exclude_notice_id=notice_id,
+        )
+        peer = load_historical_cases_for_notice(
+            db_path,
+            notice_id,
+            opened_at,
+            category=category,
+            contract_method=contract_method,
+        )
+        seen = {case.notice_id for case in cases}
+        for case in peer:
+            if case.notice_id not in seen:
+                cases.append(case)
+        return cases, parent_used
+    return (
+        load_historical_cases_for_notice(
+            db_path,
+            notice_id,
+            opened_at,
+            category=category,
+            contract_method=contract_method,
+        ),
+        None,
+    )
+
+
+def _auto_bid_pending(args: argparse.Namespace) -> dict:
+    db_path = args.db_path
+    init_db(db_path)
+    notices = load_pending_notices_for_prediction(
+        db_path=db_path,
+        category=args.category,
+        agency_name=(args.agency or "").strip() or None,
+        since_days=args.since_days if args.since_days and args.since_days > 0 else None,
+        limit=args.limit if args.limit and args.limit > 0 else None,
+    )
+    simulation_id = f"auto-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    start_automation_run(
+        db_path,
+        run_id=simulation_id,
+        kind="auto_bid_pending",
+        total_items=len(notices),
+        message="starting",
+    )
+    reports: list[dict] = []
+    batch_rows: list[dict] = []
+    failures = 0
+    saved = 0
+    try:
+        for idx, notice in enumerate(notices, start=1):
+            try:
+                cases, parent_used = _load_cases_adaptive(
+                    db_path,
+                    notice.notice_id,
+                    notice.agency_name,
+                    notice.category,
+                    notice.contract_method,
+                    notice.opened_at,
+                )
+                analyzer = AgencyRangeAnalyzer(cases, target_win_probability=args.target_win_probability)
+                prediction = NoticePredictor(analyzer).predict(notice)
+                analysis = prediction.analysis
+                winners = top_winners_for_scope(
+                    db_path,
+                    notice.agency_name,
+                    notice.category,
+                    notice.contract_method,
+                    limit=max(1, args.top_k),
+                    base_amount=notice.base_amount,
+                )
+                report = run_simulation(
+                    notice_id=notice.notice_id,
+                    base_amount=notice.base_amount,
+                    floor_rate=notice.floor_rate,
+                    predicted_rate=analysis.blended_rate,
+                    lower_rate=analysis.lower_rate,
+                    upper_rate=analysis.upper_rate,
+                    predicted_amount=analysis.recommended_amount,
+                    competitors=[
+                        CompetitorSpec(
+                            biz_no=row["biz_no"],
+                            company_name=row["company_name"],
+                            historical_rates=row["rates"],
+                            wins=row["wins"],
+                        )
+                        for row in winners
+                    ],
+                    historical_cases=cases,
+                    n_customers=max(1, args.num_customers),
+                )
+                reports.append(
+                    {
+                        "notice_id": notice.notice_id,
+                        "agency_name": notice.agency_name,
+                        "portfolio_win_rate": round(report.our_win_rate, 4),
+                        "best_customer_idx": report.best_customer_idx,
+                        "market_drift": report.market_drift,
+                        "uncertainty_score": report.uncertainty_score,
+                        "parent_used": parent_used,
+                    }
+                )
+                for customer in report.customers:
+                    batch_rows.append(
+                        {
+                            "notice_id": notice.notice_id,
+                            "bid_amount": customer.amount,
+                            "bid_rate": customer.rate,
+                            "predicted_amount": analysis.recommended_amount,
+                            "predicted_rate": analysis.blended_rate,
+                            "note": (
+                                "auto:trend-aware-quantile"
+                                f";portfolio_win_rate={report.our_win_rate:.3f}"
+                                f";role={customer.role}"
+                                f";uncertainty={report.uncertainty_score:.3f}"
+                            ),
+                            "customer_idx": customer.idx,
+                        }
+                    )
+            except Exception:
+                failures += 1
+                reports.append(
+                    {
+                        "notice_id": notice.notice_id,
+                        "agency_name": notice.agency_name,
+                        "error": "auto-bid failed",
+                    }
+                )
+            if idx == len(notices) or idx % 10 == 0:
+                update_automation_run(
+                    db_path,
+                    run_id=simulation_id,
+                    processed_items=idx,
+                    success_items=idx - failures,
+                    failed_items=failures,
+                    message=f"processing {idx}/{len(notices)}",
+                )
+        if batch_rows and not args.dry_run:
+            saved = replace_auto_mock_bid_batch(db_path, simulation_id, batch_rows)
+            bump_automation_daily_stats(
+                db_path,
+                auto_bid_runs=1,
+                auto_bid_notices=len(notices),
+                auto_bid_customer_bids=saved,
+            )
+        finish_automation_run(
+            db_path,
+            run_id=simulation_id,
+            status="completed",
+            processed_items=len(notices),
+            success_items=len(notices) - failures,
+            failed_items=failures,
+            message=f"saved {saved} customer bids",
+        )
+    except Exception as exc:
+        finish_automation_run(
+            db_path,
+            run_id=simulation_id,
+            status="failed",
+            processed_items=len(reports),
+            success_items=len(reports) - failures,
+            failed_items=failures or 1,
+            message=str(exc),
+        )
+        raise
+    return {
+        "simulation_id": simulation_id,
+        "dry_run": bool(args.dry_run),
+        "notices_seen": len(notices),
+        "customer_bids_saved": saved,
+        "reports": reports,
+    }
 
 
 def _predict_notice(db_path_text: str, notice_id: str):

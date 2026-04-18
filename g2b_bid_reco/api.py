@@ -17,6 +17,7 @@ from .db import (
     enrich_notice_from_detail,
     enrich_notice_from_result,
     stub_notice_ids,
+    upsert_demand_agency,
     upsert_bid_result,
     upsert_contract,
     upsert_notice,
@@ -46,6 +47,18 @@ PPS_ENDPOINTS = {
         "service": "http://apis.data.go.kr/1230000/ao/OrderPlanSttusService/getOrderPlanSttusListServc",
     },
 }
+
+PPS_USER_INFO_BASE_URL = "http://apis.data.go.kr/1230000/ao/UsrInfoService02"
+PPS_USER_INFO_DEMAND_AGENCY_CANDIDATES = (
+    # The exact demand-agency operation path is not exposed in the portal HTML.
+    # These candidates follow the service's published naming pattern and are
+    # probed until one returns a valid API payload instead of a 404.
+    f"{PPS_USER_INFO_BASE_URL}/getDminsttInfo02",
+    f"{PPS_USER_INFO_BASE_URL}/getDmndInsttInfo02",
+    f"{PPS_USER_INFO_BASE_URL}/getDminsttInfoList02",
+    f"{PPS_USER_INFO_BASE_URL}/getDmndInsttInfoList02",
+    f"{PPS_USER_INFO_BASE_URL}/getDemandInsttInfo02",
+)
 
 
 class ApiError(RuntimeError):
@@ -89,6 +102,13 @@ class EnrichStubResult:
     matched: int
     enriched: int
     skipped_invalid_id: int
+
+
+@dataclass
+class UserInfoSyncResult:
+    pages_fetched: int
+    items_seen: int
+    items_upserted: int
 
 
 RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -448,6 +468,57 @@ class PPSCollector:
             skipped_invalid_id=skipped_empty,
         )
 
+    def sync_demand_agencies(
+        self,
+        endpoint: str,
+        query: dict[str, Any],
+        max_pages: int = 1,
+    ) -> UserInfoSyncResult:
+        items, pages_fetched = self.client.fetch_items(endpoint, query, max_pages=max_pages)
+        upserted = 0
+        with connect(self.db_path) as conn:
+            for item in items:
+                if self._ingest_demand_agency(conn, item):
+                    upserted += 1
+        return UserInfoSyncResult(
+            pages_fetched=pages_fetched,
+            items_seen=len(items),
+            items_upserted=upserted,
+        )
+
+    def resolve_demand_agency_endpoint(
+        self,
+        endpoint: str | None = None,
+        candidates: tuple[str, ...] = PPS_USER_INFO_DEMAND_AGENCY_CANDIDATES,
+    ) -> str:
+        if endpoint:
+            return endpoint
+        probe_query = {
+            "pageNo": 1,
+            "numOfRows": 1,
+            "type": "json",
+            "inqryDiv": "1",
+        }
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                self.client.fetch_items(candidate, dict(probe_query), max_pages=1)
+                return candidate
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code == 404:
+                    continue
+                return candidate
+            except ApiError as exc:
+                # API-level validation errors still mean the endpoint exists.
+                return candidate
+            except urllib.error.URLError as exc:
+                last_error = exc
+                continue
+        if last_error:
+            raise last_error
+        raise ApiError("Unable to resolve demand-agency endpoint")
+
     @staticmethod
     def _ingest_notice(conn, category: str, item: dict[str, Any]) -> bool:
         notice_id = _notice_id(item)
@@ -535,10 +606,66 @@ class PPSCollector:
             conn=conn,
             plan_id=plan_id,
             agency_name=_first_non_empty(item, ["orderInsttNm", "dminsttNm", "dmndInsttNm"], ""),
+            agency_code=str(_first_non_empty(item, ["orderInsttCd", "dminsttCd", "dmndInsttCd"], "") or ""),
             category=category,
             budget_amount=_to_float(_first_non_empty(item, ["asignBdgtAmt", "presmptPrce", "budgetAmount"], 0)),
             planned_quarter=_first_non_empty(item, ["orderBgnYm", "orderEndYm", "orderTmnlYm"], ""),
             contract_method=_first_non_empty(item, ["cntrctMthdNm", "orderMthdNm"], ""),
+        )
+        return True
+
+    @staticmethod
+    def _ingest_demand_agency(conn, item: dict[str, Any]) -> bool:
+        agency_code = str(_first_non_empty(
+            item,
+            [
+                "dminsttCd", "dmndInsttCd", "ntceInsttCd",
+                "orgCd", "insttCd", "userInsttCd",
+            ],
+            "",
+        ) or "")
+        if not agency_code:
+            return False
+        agency_name = _first_non_empty(
+            item,
+            [
+                "dminsttNm", "dmndInsttNm", "ntceInsttNm",
+                "orgNm", "insttNm", "userInsttNm",
+            ],
+            "",
+        ) or ""
+        upsert_demand_agency(
+            conn=conn,
+            agency_code=agency_code,
+            agency_name=agency_name,
+            top_agency_code=str(_first_non_empty(
+                item,
+                ["topInsttCd", "upperInsttCd", "hghrInsttCd", "topDminsttCd"],
+                "",
+            ) or ""),
+            top_agency_name=_first_non_empty(
+                item,
+                ["topInsttNm", "upperInsttNm", "hghrInsttNm", "topDminsttNm"],
+                "",
+            ) or "",
+            jurisdiction_type=_first_non_empty(
+                item,
+                ["jurirnoDivNm", "psitnDivNm", "sptDvsNm", "psitnNm"],
+                "",
+            ) or "",
+            address=_first_non_empty(
+                item,
+                ["insttAddr", "dminsttAddr", "dmndInsttAddr", "orgAddr"],
+                "",
+            ) or "",
+            road_address=_first_non_empty(
+                item,
+                ["insttRoadNmAddr", "roadNmAddr", "rnAddr"],
+                "",
+            ) or "",
+            postal_code=str(_first_non_empty(item, ["zipNo", "postNo"], "") or ""),
+            source="user-api",
+            raw_json=json.dumps(item, ensure_ascii=False, separators=(",", ":")),
         )
         return True
 

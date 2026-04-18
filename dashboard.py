@@ -23,14 +23,19 @@ from g2b_bid_reco.db import (
     add_suggestion,
     auto_generate_suggestions,
     compute_weekly_metrics,
+    get_monitoring_alerts,
+    get_monitoring_overview,
+    get_operations_summary,
+    get_cached_notice_prediction,
     connect,
     delete_mock_bid,
     get_actual_award,
     get_notice_snapshot,
+    init_db,
     list_agencies_with_backtestable_notices,
     list_agency_parent_mappings,
     list_metrics_snapshots,
-    list_mock_bids,
+    list_pending_notice_prediction_rows,
     list_simulation_ids,
     list_suggestions,
     load_backtestable_notices_for_agency,
@@ -39,11 +44,11 @@ from g2b_bid_reco.db import (
     load_pending_notices_for_prediction,
     resolve_adaptive_agencies,
     revenue_summary,
-    save_mock_bid,
-    save_mock_bid_batch,
+    replace_auto_mock_bid_batch,
     seed_agency_parent_mapping,
     take_weekly_snapshot,
     top_winners_for_scope,
+    upsert_notice_prediction_cache,
     update_agency_parent_status,
     update_suggestion,
 )
@@ -95,7 +100,297 @@ def _format_pct(value) -> str:
     except (TypeError, ValueError):
         return "–"
 
-DEFAULT_DB_PATH = os.environ.get("G2B_DB_PATH", "data/bids.db")
+
+def _format_count(value, suffix: str = "") -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return f"–{suffix}"
+    try:
+        return f"{int(value):,}{suffix}"
+    except (TypeError, ValueError):
+        return f"–{suffix}"
+
+
+def _kind_label(kind: str) -> str:
+    return {
+        "collect_recent:service": "용역 수집",
+        "collect_recent:goods": "물품 수집",
+        "collect_recent:construction": "공사 수집",
+        "sync_demand_agencies": "수요기관 동기화",
+        "auto_bid_pending": "자동 입찰 생성",
+    }.get(kind, kind)
+
+
+def _inject_dashboard_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+          --sub-card-border: rgba(15, 23, 42, 0.08);
+          --sub-card-shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+          --sub-card-text: #0f172a;
+          --sub-card-muted: #64748b;
+          --sub-card-bg: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98));
+        }
+        .subpro-card-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 10px;
+          margin: 0.35rem 0 0.7rem 0;
+        }
+        .subpro-stat-card {
+          position: relative;
+          overflow: hidden;
+          border-radius: 14px;
+          padding: 12px 13px 11px 13px;
+          background: var(--sub-card-bg);
+          border: 1px solid var(--sub-card-border);
+          box-shadow: var(--sub-card-shadow);
+        }
+        .subpro-stat-card::before {
+          content: "";
+          position: absolute;
+          inset: 0 auto 0 0;
+          width: 5px;
+          background: var(--accent, #1d4ed8);
+        }
+        .subpro-stat-label {
+          font-size: 0.76rem;
+          font-weight: 700;
+          color: var(--sub-card-muted);
+          letter-spacing: -0.01em;
+          margin-bottom: 6px;
+        }
+        .subpro-stat-value {
+          font-size: 1.5rem;
+          line-height: 1;
+          font-weight: 800;
+          color: var(--sub-card-text);
+          letter-spacing: -0.04em;
+          margin-bottom: 6px;
+        }
+        .subpro-stat-meta {
+          font-size: 0.75rem;
+          color: var(--sub-card-muted);
+          line-height: 1.25;
+        }
+        .subpro-summary-band {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          border-radius: 14px;
+          padding: 10px 13px;
+          margin: 0.35rem 0 0.8rem 0;
+          background: linear-gradient(135deg, #eff6ff, #f8fafc 55%, #ecfeff);
+          border: 1px solid rgba(59, 130, 246, 0.14);
+        }
+        .subpro-summary-title {
+          font-size: 0.84rem;
+          font-weight: 700;
+          color: #0f172a;
+          margin-bottom: 2px;
+        }
+        .subpro-summary-detail {
+          font-size: 0.75rem;
+          color: #475569;
+          line-height: 1.25;
+        }
+        .subpro-badge {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 999px;
+          padding: 4px 10px;
+          font-size: 0.72rem;
+          font-weight: 700;
+          white-space: nowrap;
+          color: var(--badge-text, #1e293b);
+          background: var(--badge-bg, rgba(148, 163, 184, 0.16));
+          border: 1px solid var(--badge-border, rgba(148, 163, 184, 0.22));
+        }
+        .subpro-alert-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+          gap: 8px;
+          margin: 0.25rem 0 0.7rem 0;
+        }
+        .subpro-alert-chip {
+          border-radius: 12px;
+          border: 1px solid;
+          padding: 9px 11px;
+        }
+        .subpro-alert-title {
+          font-size: 0.75rem;
+          font-weight: 800;
+          margin-bottom: 3px;
+        }
+        .subpro-alert-detail {
+          font-size: 0.73rem;
+          line-height: 1.3;
+        }
+        .subpro-run-card {
+          border-radius: 14px;
+          border: 1px solid rgba(15, 23, 42, 0.08);
+          background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98));
+          box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+          padding: 11px 13px;
+          margin-bottom: 10px;
+        }
+        .subpro-run-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 10px;
+          margin-bottom: 7px;
+        }
+        .subpro-run-title {
+          font-size: 0.85rem;
+          font-weight: 800;
+          color: #0f172a;
+        }
+        .subpro-run-meta {
+          font-size: 0.73rem;
+          color: #64748b;
+          line-height: 1.35;
+          margin-top: 5px;
+        }
+        .subpro-progress-track {
+          width: 100%;
+          height: 8px;
+          border-radius: 999px;
+          background: rgba(148, 163, 184, 0.16);
+          overflow: hidden;
+          margin: 6px 0 4px 0;
+        }
+        .subpro-progress-bar {
+          height: 100%;
+          border-radius: 999px;
+          background: linear-gradient(90deg, #2563eb, #06b6d4);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_stat_card(
+    label: str,
+    value: str,
+    *,
+    meta: str = "",
+    accent: str = "#2563eb",
+) -> str:
+    return (
+        f"<div class='subpro-stat-card' style='--accent:{accent};'>"
+        f"<div class='subpro-stat-label'>{label}</div>"
+        f"<div class='subpro-stat-value'>{value}</div>"
+        f"<div class='subpro-stat-meta'>{meta or '&nbsp;'}</div>"
+        f"</div>"
+    )
+
+
+def _status_badge_html(label: str, *, tone: str = "neutral") -> str:
+    tone_map = {
+        "running": ("#d97706", "rgba(245, 158, 11, 0.14)", "rgba(245, 158, 11, 0.24)"),
+        "completed": ("#166534", "rgba(34, 197, 94, 0.14)", "rgba(34, 197, 94, 0.24)"),
+        "failed": ("#b91c1c", "rgba(248, 113, 113, 0.14)", "rgba(248, 113, 113, 0.24)"),
+        "neutral": ("#334155", "rgba(148, 163, 184, 0.14)", "rgba(148, 163, 184, 0.24)"),
+    }
+    text, bg, border = tone_map.get(tone, tone_map["neutral"])
+    return (
+        "<span class='subpro-badge' "
+        f"style='--badge-text:{text};--badge-bg:{bg};--badge-border:{border};'>{label}</span>"
+    )
+
+
+def _alert_badge_html(title: str, detail: str, *, severity: str) -> str:
+    tone_map = {
+        "high": ("#991b1b", "rgba(248, 113, 113, 0.14)", "rgba(248, 113, 113, 0.24)"),
+        "medium": ("#9a3412", "rgba(251, 191, 36, 0.16)", "rgba(251, 191, 36, 0.26)"),
+        "low": ("#166534", "rgba(34, 197, 94, 0.14)", "rgba(34, 197, 94, 0.24)"),
+    }
+    text, bg, border = tone_map.get(severity, tone_map["medium"])
+    return (
+        "<div class='subpro-alert-chip' "
+        f"style='color:{text};background:{bg};border-color:{border};'>"
+        f"<div class='subpro-alert-title'>{title}</div>"
+        f"<div class='subpro-alert-detail'>{detail}</div>"
+        "</div>"
+    )
+
+
+def _run_elapsed_minutes(run: dict) -> float:
+    started = pd.to_datetime(run.get("started_at"), errors="coerce")
+    ended = pd.to_datetime(run.get("finished_at") or run.get("updated_at"), errors="coerce")
+    if pd.isna(started) or pd.isna(ended):
+        return 0.0
+    return max(0.0, round((ended - started).total_seconds() / 60.0, 1))
+
+
+def _run_progress_ratio(run: dict) -> float | None:
+    total = int(run.get("total_items") or 0)
+    processed = int(run.get("processed_items") or 0)
+    if total <= 0:
+        return None
+    return min(1.0, max(0.0, processed / total))
+
+
+def _run_status_snapshot(run: dict, stalled_after_minutes: float = 3.0) -> dict:
+    status = str(run.get("status") or "")
+    updated_at = pd.to_datetime(run.get("updated_at"), errors="coerce")
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    minutes_since_update = 0.0
+    if not pd.isna(updated_at):
+        minutes_since_update = max(
+            0.0, round((now - updated_at).total_seconds() / 60.0, 1)
+        )
+    if status == "running":
+        if minutes_since_update >= stalled_after_minutes:
+            return {
+                "label": "멈춤 의심",
+                "active": False,
+                "tone": "warning",
+                "minutes_since_update": minutes_since_update,
+            }
+        return {
+            "label": "실행 중",
+            "active": True,
+            "tone": "info",
+            "minutes_since_update": minutes_since_update,
+        }
+    if status == "completed":
+        return {
+            "label": "완료",
+            "active": False,
+            "tone": "success",
+            "minutes_since_update": minutes_since_update,
+        }
+    if status == "failed":
+        return {
+            "label": "실패",
+            "active": False,
+            "tone": "error",
+            "minutes_since_update": minutes_since_update,
+        }
+    return {
+        "label": "대기",
+        "active": False,
+        "tone": "info",
+        "minutes_since_update": minutes_since_update,
+    }
+
+
+def _resolve_default_db_path() -> str:
+    env_path = os.environ.get("G2B_DB_PATH")
+    if env_path:
+        return env_path
+    runner_path = Path.home() / "Library/Application Support/sub_pro-runner/data/bids.db"
+    if runner_path.exists():
+        return str(runner_path)
+    return "data/bids.db"
+
+
+DEFAULT_DB_PATH = _resolve_default_db_path()
 CATEGORY_KEY_TO_LABEL = {
     "service": "용역",
     "goods": "물품",
@@ -447,8 +742,8 @@ def _render_table(df: pd.DataFrame) -> None:
     )
 
 
-@st.cache_data(show_spinner="진행 중 공고들의 예측 투찰가를 계산 중...")
-def _load_pending_rows(
+@st.cache_data(show_spinner="진행 중 공고 목록을 불러오는 중...")
+def _load_pending_notice_rows(
     db_path: str,
     category: str | None,
     agency_name: str | None,
@@ -456,63 +751,14 @@ def _load_pending_rows(
     limit: int,
     target_win_probability: float,
 ) -> pd.DataFrame:
-    notices = load_pending_notices_for_prediction(
-        db_path=db_path,
+    rows = list_pending_notice_prediction_rows(
+        db_path,
+        target_win_probability=target_win_probability,
         category=category,
         agency_name=agency_name,
         since_days=since_days,
         limit=limit,
     )
-    rows: list[dict] = []
-    for notice in notices:
-        try:
-            cases, parent_used = _load_cases_adaptive(
-                db_path, notice.notice_id, notice.agency_name, notice.category,
-                notice.contract_method, notice.opened_at,
-            )
-            analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
-            prediction = NoticePredictor(analyzer).predict(notice)
-            if parent_used:
-                prediction.analysis.notes.append(
-                    f"sparse-agency fallback: 부모 '{parent_used}'로 확장된 풀로 예측했습니다."
-                )
-            analysis = prediction.analysis
-            predicted_amount = analysis.recommended_amount
-            predicted_rate = analysis.blended_rate
-            est_win = analysis.estimated_win_probability
-            lookback = analysis.lookback_years_used
-            agency_cases = analysis.agency_case_count
-            peer_cases = analysis.peer_case_count
-            confidence = analysis.confidence
-        except Exception:
-            predicted_amount = None
-            predicted_rate = None
-            est_win = 0.0
-            lookback = None
-            agency_cases = 0
-            peer_cases = 0
-            confidence = "error"
-
-        rows.append({
-            "opened_at": notice.opened_at,
-            "notice_id": notice.notice_id,
-            "category": notice.category,
-            "agency_name": notice.agency_name,
-            "contract_method": notice.contract_method,
-            "region": notice.region,
-            "base_amount": notice.base_amount,
-            "floor_rate": notice.floor_rate,
-            "predicted_rate": predicted_rate,
-            "predicted_amount": predicted_amount,
-            "estimated_win_probability": est_win,
-            "agency_cases": agency_cases,
-            "peer_cases": peer_cases,
-            "lookback_years_used": lookback,
-            "confidence": confidence,
-            "detail_url": _build_g2b_detail_url(notice.notice_id, notice.category),
-            "search_url": _build_search_fallback_url(notice.notice_id),
-        })
-
     df = pd.DataFrame(rows)
     if not df.empty:
         df["opened_at"] = pd.to_datetime(df["opened_at"], errors="coerce")
@@ -520,11 +766,58 @@ def _load_pending_rows(
     return df
 
 
+def _compute_and_store_notice_prediction(
+    db_path: str,
+    notice: BidNoticeSnapshot,
+    target_win_probability: float,
+) -> dict:
+    cases, parent_used = _load_cases_adaptive(
+        db_path, notice.notice_id, notice.agency_name, notice.category,
+        notice.contract_method, notice.opened_at,
+    )
+    analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
+    prediction = NoticePredictor(analyzer).predict(notice)
+    if parent_used:
+        prediction.analysis.notes.append(
+            f"sparse-agency fallback: 부모 '{parent_used}'로 확장된 풀로 예측했습니다."
+        )
+    analysis = prediction.analysis
+    notes_text = "\n".join(analysis.notes)
+    upsert_notice_prediction_cache(
+        db_path,
+        notice,
+        target_win_probability,
+        predicted_amount=analysis.recommended_amount,
+        predicted_rate=analysis.blended_rate,
+        lower_rate=analysis.lower_rate,
+        upper_rate=analysis.upper_rate,
+        estimated_win_probability=analysis.estimated_win_probability,
+        confidence=analysis.confidence,
+        agency_cases=analysis.agency_case_count,
+        peer_cases=analysis.peer_case_count,
+        lookback_years_used=analysis.lookback_years_used,
+        parent_used=parent_used,
+        analysis_notes=notes_text,
+    )
+    cached = get_cached_notice_prediction(db_path, notice, target_win_probability)
+    if cached is None:
+        raise RuntimeError("prediction cache write failed")
+    return cached
+
+
+def _cache_status_label(value: str) -> str:
+    return {
+        "ready": "저장됨",
+        "stale": "갱신 필요",
+        "missing": "미계산",
+    }.get(str(value or ""), "미계산")
+
+
 def _render_live_view(db_path: str, target_win_probability: float) -> None:
     st.subheader("진행 중 / 낙찰 미확정 공고")
     st.caption(
-        "아직 낙찰 결과가 연결되지 않은 공고들에 대해 즉시 예측 투찰가를 계산합니다. "
-        "상세 링크는 나라장터 공고 페이지로 연결됩니다(로그인 필요할 수 있음)."
+        "진행 중 공고 목록은 즉시 불러오고, 선택한 공고만 예측 계산합니다. "
+        "저장된 결과는 새 데이터가 적재되기 전까지 재사용됩니다."
     )
 
     with st.container(border=True):
@@ -550,10 +843,10 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
                 "최대 표시 건수",
                 min_value=10,
                 max_value=1000,
-                value=30,
+                value=200,
                 step=10,
                 key="live_limit",
-                help="너무 큰 값은 예측 계산 시간이 오래 걸립니다. 처음엔 30~50 권장.",
+                help="목록 조회는 빠르지만, 표 가독성을 위해 처음엔 100~200 정도를 권장합니다.",
             )
 
         agency_filter = st.text_input(
@@ -563,18 +856,7 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         )
 
     category = dict(CATEGORY_DROPDOWN)[category_label]
-
-    run_key = (category_label, int(since_days), int(limit), agency_filter.strip(), target_win_probability)
-    if st.session_state.get("live_last_run_key") != run_key:
-        if not st.button("🔮 예측 계산 실행", key="live_run_btn"):
-            st.info(
-                "Live 예측은 공고마다 과거 이력을 스캔해서 시간이 걸립니다. "
-                "위 조건을 확인한 뒤 버튼을 눌러 계산을 시작하세요."
-            )
-            return
-        st.session_state["live_last_run_key"] = run_key
-
-    df = _load_pending_rows(
+    df = _load_pending_notice_rows(
         db_path=db_path,
         category=category,
         agency_name=agency_filter.strip() or None,
@@ -587,30 +869,6 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         st.info("조건에 맞는 진행 중 공고가 없습니다. 기간/구분/기관명을 조정해 보세요.")
         return
 
-    def _format_amount(value) -> str:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "–"
-        try:
-            return f"{float(value):,.0f}"
-        except (TypeError, ValueError):
-            return "–"
-
-    def _format_rate(value) -> str:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "–"
-        try:
-            return f"{float(value):,.3f}"
-        except (TypeError, ValueError):
-            return "–"
-
-    def _format_pct(value) -> str:
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return "–"
-        try:
-            return f"{float(value) * 100:.0f}%"
-        except (TypeError, ValueError):
-            return "–"
-
     display = df.assign(
         category=df["category"].map(_humanize_category),
         base_amount=df["base_amount"].map(_format_amount),
@@ -618,6 +876,7 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         predicted_rate=df["predicted_rate"].map(_format_rate),
         floor_rate=df["floor_rate"].map(_format_rate),
         est_win=df["estimated_win_probability"].map(_format_pct),
+        cache_status=df["cache_status"].map(_cache_status_label),
     )[
         [
             "opened_at",
@@ -626,6 +885,8 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
             "agency_name",
             "contract_method",
             "base_amount",
+            "cache_status",
+            "cached_at",
             "predicted_amount",
             "predicted_rate",
             "floor_rate",
@@ -633,14 +894,12 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
             "confidence",
             "agency_cases",
             "peer_cases",
-            "detail_url",
         ]
     ]
     display.columns = [
         "개찰일", "공고번호", "구분", "기관", "계약방법",
-        "예산", "예측투찰가", "예측률(%)", "하한율(%)",
+        "예산", "상태", "계산시각", "예측투찰가", "예측률(%)", "하한율(%)",
         "추정 낙찰확률", "신뢰도", "기관사례", "peer사례",
-        "나라장터 링크",
     ]
 
     selection_event = st.dataframe(
@@ -651,13 +910,6 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         on_select="rerun",
         selection_mode="single-row",
         key="live_notice_table",
-        column_config={
-            "나라장터 링크": st.column_config.LinkColumn(
-                "나라장터 공고",
-                display_text="🔗 공고 열기",
-                help="나라장터 공고 상세 URL (taskClCd가 맞지 않으면 열리지 않을 수 있음)",
-            ),
-        },
     )
 
     selected_indices = []
@@ -667,11 +919,324 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         selected_indices = []
 
     if not selected_indices:
-        st.info("위 표에서 공고 행을 클릭하면 해당 기관의 과거 낙찰 추이와 분포가 아래에 펼쳐집니다.")
+        st.info("위 표에서 공고 행을 클릭하면 저장된 결과를 확인하거나 해당 공고만 계산할 수 있습니다.")
         return
 
     selected_row = df.iloc[int(selected_indices[0])].to_dict()
-    _render_notice_detail(db_path, selected_row)
+    notice = get_notice_snapshot(db_path, str(selected_row["notice_id"]))
+    if notice is None:
+        st.warning("선택한 공고 정보를 불러오지 못했습니다.")
+        return
+
+    cached = get_cached_notice_prediction(db_path, notice, target_win_probability)
+
+    st.markdown("---")
+    opened = pd.to_datetime(notice.opened_at, errors="coerce")
+    opened_label = opened.strftime("%Y-%m-%d") if not pd.isna(opened) else str(notice.opened_at or "–")
+    top1, top2, top3, top4 = st.columns(4)
+    top1.metric("공고번호", notice.notice_id)
+    top2.metric("기관", notice.agency_name)
+    top3.metric("개찰일", opened_label)
+    top4.metric("계산 상태", _cache_status_label(selected_row.get("cache_status")))
+    st.caption(
+        f"계약방법 {notice.contract_method} · 구분 {_humanize_category(notice.category)} · "
+        f"예산 {_format_amount(notice.base_amount)}원 · "
+        f"[나라장터 공고 열기]({_build_g2b_detail_url(notice.notice_id, notice.category)})"
+    )
+
+    button_label = "예측 다시 계산" if cached else "이 공고 예측 계산"
+    if st.button(button_label, key=f"compute_notice_prediction_{notice.notice_id}", type="primary"):
+        with st.spinner("선택한 공고의 예측을 계산하고 저장하는 중..."):
+            cached = _compute_and_store_notice_prediction(db_path, notice, target_win_probability)
+        _load_pending_notice_rows.clear()
+        st.success("예측 결과를 저장했습니다.")
+        st.rerun()
+
+    if cached is None:
+        st.info("저장된 예측 결과가 없습니다. 위 버튼을 눌러 이 공고만 계산하세요.")
+        return
+
+    info1, info2, info3, info4 = st.columns(4)
+    info1.metric("예측 투찰가", _format_amount(cached.get("predicted_amount")))
+    info2.metric("예측률", f"{_format_rate(cached.get('predicted_rate'))}%")
+    info3.metric("추정 낙찰확률", _format_pct(cached.get("estimated_win_probability")))
+    info4.metric("계산시각", str(cached.get("computed_at") or "–"))
+    sub1, sub2, sub3, sub4 = st.columns(4)
+    sub1.metric("하한율", f"{_format_rate(notice.floor_rate)}%")
+    sub2.metric("신뢰도", str(cached.get("confidence") or "–"))
+    sub3.metric("기관사례", f"{int(cached.get('agency_cases') or 0):,}건")
+    sub4.metric("peer사례", f"{int(cached.get('peer_cases') or 0):,}건")
+    if cached.get("analysis_notes"):
+        st.caption(str(cached["analysis_notes"]).replace("\n", "  \n"))
+
+    detail_row = {
+        "opened_at": opened,
+        "notice_id": notice.notice_id,
+        "agency_name": notice.agency_name,
+        "contract_method": notice.contract_method,
+        "base_amount": notice.base_amount,
+        "predicted_amount": cached.get("predicted_amount"),
+        "predicted_rate": cached.get("predicted_rate"),
+        "estimated_win_probability": cached.get("estimated_win_probability") or 0.0,
+    }
+    _render_notice_detail(db_path, detail_row)
+
+
+def _render_operations_summary(db_path: str) -> None:
+    summary = get_operations_summary(db_path)
+    st.subheader("운영 요약")
+    st.caption("오늘 기준 진행 상태와 자동 모의 입찰 커버리지를 실시간으로 보여줍니다.")
+    coverage_pct = (
+        (summary["auto_covered_pending"] / summary["pending_total"]) * 100.0
+        if summary["pending_total"] else 0.0
+    )
+    eval_pct = (
+        (summary["evaluated_today"] / summary["completed_today"]) * 100.0
+        if summary["completed_today"] else 0.0
+    )
+    top_cards = [
+        _render_stat_card("진행 중 발주", _format_count(summary["pending_total"], "건"), meta="현재 결과 미확정 공고", accent="#2563eb"),
+        _render_stat_card("신규 입수", _format_count(summary["new_today"], "건"), meta="오늘 새로 적재된 공고", accent="#0891b2"),
+        _render_stat_card("오늘 완료", _format_count(summary["completed_today"], "건"), meta="오늘 결과가 들어온 공고", accent="#7c3aed"),
+        _render_stat_card("평가 완료", _format_count(summary["evaluated_today"], "건"), meta=f"오늘 완료 대비 {eval_pct:.1f}%", accent="#16a34a"),
+        _render_stat_card("자동입찰 커버", _format_count(summary["auto_covered_pending"], "건"), meta=f"진행 중 대비 {coverage_pct:.1f}%", accent="#ea580c"),
+    ]
+    api_cards = [
+        _render_stat_card("오늘 API 호출", _format_count(summary["total_api_calls_today"], "회"), meta="수집 + 기관 API 합계", accent="#0f766e"),
+        _render_stat_card("수집 API", _format_count(summary["collect_api_calls_today"], "회"), meta="입찰/결과/계약 수집", accent="#0284c7"),
+        _render_stat_card("기관 API", _format_count(summary["agency_api_calls_today"], "회"), meta="수요기관 사용자정보", accent="#9333ea"),
+        _render_stat_card("오늘 자동입찰", _format_count(summary["auto_bid_notices_today"], "건"), meta="오늘 생성된 자동 포트폴리오", accent="#ca8a04"),
+    ]
+    st.markdown(f"<div class='subpro-card-grid'>{''.join(top_cards)}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='subpro-card-grid'>{''.join(api_cards)}</div>", unsafe_allow_html=True)
+    latest_run = summary.get("latest_auto_bid_run")
+    if latest_run:
+        processed = int(latest_run.get("processed_items") or 0)
+        total = int(latest_run.get("total_items") or 0)
+        success = int(latest_run.get("success_items") or 0)
+        failed = int(latest_run.get("failed_items") or 0)
+        status = str(latest_run.get("status") or "")
+        badge = _status_badge_html(
+            "실행 중" if status == "running" else "완료" if status == "completed" else "실패",
+            tone="running" if status == "running" else "completed" if status == "completed" else "failed",
+        )
+        st.markdown(
+            (
+                "<div class='subpro-summary-band'>"
+                "<div>"
+                "<div class='subpro-summary-title'>최근 자동 입찰 배치</div>"
+                f"<div class='subpro-summary-detail'>`{latest_run.get('run_id')}` · "
+                f"{_format_count(processed)}/{_format_count(total)} 공고 처리 ({summary['latest_auto_bid_progress_pct']:.1f}%) · "
+                f"성공 {_format_count(success)} · 실패 {_format_count(failed)}</div>"
+                "</div>"
+                f"{badge}"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        if latest_run.get("status") == "running" and total > 0:
+            st.progress(min(1.0, processed / total))
+    st.markdown("---")
+
+
+@st.fragment(run_every="5s")
+def _render_operations_summary_fragment(db_path: str) -> None:
+    _render_operations_summary(db_path)
+
+
+def _render_realtime_status_content(db_path: str) -> None:
+    overview = get_monitoring_overview(db_path)
+    alerts = get_monitoring_alerts(db_path)
+    active_runs = [
+        run for run in overview["latest_runs"]
+        if _run_status_snapshot(run).get("active")
+    ]
+
+    st.subheader("운영 모니터링")
+    if active_runs:
+        st.caption("실행 중인 배치가 있어 이 영역만 5초마다 자동 갱신합니다.")
+        st.markdown("#### 실시간 실행 현황")
+        for run in active_runs:
+            progress_ratio = _run_progress_ratio(run)
+            elapsed_minutes = _run_elapsed_minutes(run)
+            processed = int(run.get("processed_items") or 0)
+            total = int(run.get("total_items") or 0)
+            success = int(run.get("success_items") or 0)
+            failed = int(run.get("failed_items") or 0)
+            status_snapshot = _run_status_snapshot(run)
+            badge = _status_badge_html(
+                status_snapshot["label"],
+                tone=(
+                    "running" if status_snapshot["label"] == "실행 중"
+                    else "completed" if status_snapshot["label"] == "완료"
+                    else "failed" if status_snapshot["label"] in {"실패", "멈춤 의심"}
+                    else "neutral"
+                ),
+            )
+            progress_pct = progress_ratio * 100.0 if progress_ratio is not None else 0.0
+            progress_bar = (
+                "<div class='subpro-progress-track'>"
+                f"<div class='subpro-progress-bar' style='width:{progress_pct:.1f}%'></div>"
+                "</div>"
+            )
+            st.markdown(
+                (
+                    "<div class='subpro-run-card'>"
+                    "<div class='subpro-run-head'>"
+                    f"<div class='subpro-run-title'>{_kind_label(str(run.get('kind') or ''))}</div>"
+                    f"{badge}"
+                    "</div>"
+                    f"{progress_bar}"
+                    f"<div class='subpro-run-meta'>{_format_count(processed)}/{_format_count(total)} 처리 · "
+                    f"성공 {_format_count(success)} · 실패 {_format_count(failed)} · 경과 {elapsed_minutes:.1f}분</div>"
+                    + (
+                        f"<div class='subpro-run-meta'>현재 단계: {run.get('message')}</div>"
+                        if run.get("message") else ""
+                    )
+                    + "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("실행 중인 배치가 없습니다. 자동 갱신은 이 영역에서만 최소 비용으로 동작합니다.")
+
+    if alerts:
+        st.markdown(
+            "<div class='subpro-alert-grid'>"
+            + "".join(
+                _alert_badge_html(
+                    str(alert["title"]),
+                    str(alert["detail"]),
+                    severity=str(alert["severity"]),
+                )
+                for alert in alerts
+            )
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.success("현재 감지된 운영 이상징후가 없습니다.")
+
+    with st.expander("배치 상태 / 데이터 신선도"):
+        runs = pd.DataFrame(overview["latest_runs"])
+        if not runs.empty:
+            runs["소요분"] = runs.apply(
+                lambda row: (
+                    round((pd.to_datetime(row["finished_at"] or row["updated_at"]) - pd.to_datetime(row["started_at"])).total_seconds() / 60.0, 1)
+                    if row.get("started_at") else None
+                ),
+                axis=1,
+            )
+            runs = runs.rename(columns={
+                "kind": "배치종류",
+                "status": "상태",
+                "total_items": "전체",
+                "processed_items": "처리",
+                "success_items": "성공",
+                "failed_items": "실패",
+                "started_at": "시작시각",
+                "finished_at": "종료시각",
+                "message": "메시지",
+            })
+            st.dataframe(runs, hide_index=True, use_container_width=True)
+
+        freshness = pd.DataFrame(overview["freshness"])
+        if not freshness.empty:
+            freshness_cards = []
+            for row in freshness.to_dict("records"):
+                freshness_cards.append(
+                    _render_stat_card(
+                        _humanize_category(str(row["category"])),
+                        "신선",
+                        meta=(
+                            f"공고 {row.get('latest_opened_at') or '–'}<br>"
+                            f"적재 {row.get('latest_ingested_at') or '–'}"
+                        ),
+                        accent="#0ea5e9",
+                    )
+                )
+            st.markdown(
+                "<div class='subpro-card-grid'>" + "".join(freshness_cards) + "</div>",
+                unsafe_allow_html=True,
+            )
+
+
+@st.fragment(run_every="5s")
+def _render_realtime_status_fragment(db_path: str) -> None:
+    _render_realtime_status_content(db_path)
+
+
+def _render_monitoring_panel(db_path: str) -> None:
+    _render_realtime_status_fragment(db_path)
+
+
+def _render_mock_realtime_status_content(db_path: str) -> None:
+    auto_bid_run = get_latest_automation_run(db_path, "auto_bid_pending")
+    if auto_bid_run is None:
+        st.caption("최근 자동 입찰 배치 이력이 아직 없습니다.")
+        return
+
+    run = dict(auto_bid_run)
+    status_snapshot = _run_status_snapshot(run)
+    processed = int(run.get("processed_items") or 0)
+    total = int(run.get("total_items") or 0)
+    success = int(run.get("success_items") or 0)
+    failed = int(run.get("failed_items") or 0)
+    elapsed_minutes = _run_elapsed_minutes(run)
+    progress_ratio = _run_progress_ratio(run)
+    prev_processed_key = "mock_tab_prev_auto_bid_processed"
+    prev_processed = int(st.session_state.get(prev_processed_key, processed))
+    delta_processed = processed - prev_processed
+    st.session_state[prev_processed_key] = processed
+
+    with st.container(border=True):
+        st.markdown("### 실시간 자동 입찰 상태")
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("상태", status_snapshot["label"])
+        s2.metric("처리", f"{_format_count(processed)} / {_format_count(total)}" if total else _format_count(processed, "건"))
+        s3.metric("성공", _format_count(success, "건"))
+        s4.metric("실패", _format_count(failed, "건"))
+        s5.metric("경과", f"{elapsed_minutes:.1f}분")
+        if progress_ratio is not None:
+            st.progress(progress_ratio)
+            st.caption(
+                f"전체 {_format_count(total, '건')} 중 {_format_count(processed, '건')} 처리 ({progress_ratio * 100:.1f}%)"
+                + (
+                    f" · 마지막 새로고침 이후 +{_format_count(delta_processed, '건')}"
+                    if delta_processed > 0 else ""
+                )
+            )
+        else:
+            st.progress(0)
+            st.caption(
+                "전체 대상 수를 아직 집계 중입니다."
+                + (
+                    f" 마지막 새로고침 이후 +{_format_count(delta_processed, '건')}"
+                    if delta_processed > 0 else ""
+                )
+            )
+        if run.get("message"):
+            st.write(f"현재 단계: {run['message']}")
+        st.caption(f"마지막 상태 갱신 {status_snapshot['minutes_since_update']:.1f}분 전")
+        if status_snapshot["label"] == "완료":
+            st.success("최근 자동 입찰 배치가 정상 완료됐습니다.")
+        elif status_snapshot["label"] == "실패":
+            st.error("최근 자동 입찰 배치가 실패 상태로 종료됐습니다.")
+        elif status_snapshot["label"] == "멈춤 의심":
+            st.warning(
+                "최근 자동 입찰 배치가 running으로 남아 있지만 상태 갱신이 멈췄습니다. "
+                "프로세스 중단 여부를 점검해야 합니다."
+            )
+        elif run.get("status") == "running" and delta_processed <= 0 and processed > 0:
+            st.info(
+                "숫자가 바로 안 올라가더라도 큰 공고 묶음을 계산 중일 수 있습니다. "
+                "같은 값이 계속 유지되면 멈춤 여부를 추가 점검하면 됩니다."
+            )
+
+
+@st.fragment(run_every="5s")
+def _render_mock_realtime_status_fragment(db_path: str) -> None:
+    _render_mock_realtime_status_content(db_path)
 
 
 def _render_notice_detail(db_path: str, row: dict) -> None:
@@ -993,12 +1558,12 @@ def _render_review_tab(db_path: str, fee_rate: float) -> None:
 
 
 def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
-    st.subheader("자동 모의 입찰 (Monte Carlo 배치)")
+    st.subheader("자동 모의 입찰 포트폴리오")
     st.caption(
-        "진행 중 공고에 대해 1) 내 고객 1~10명이 분산 전략으로 투찰, 2) 해당 scope의 과거 반복 낙찰 top-10 업체가 "
-        "각자 과거 투찰률 분포에서 샘플링해 경쟁한다고 가정. N회 시뮬레이션으로 승률을 측정하고, "
-        "고객 투찰 내역을 DB에 저장해 이후 실제 결과 도착 시 수익(수수료) 합계까지 자동 집계합니다."
+        "진행 중 공고에 대해 예측값과 최근 낙찰 추세를 결합해 고객별 분산 투찰 포트폴리오를 자동 생성합니다. "
+        "저장된 모의 입찰은 실제 결과 수집 시 자동 평가되어 낙찰 건수와 수익 집계에 반영됩니다."
     )
+    _render_mock_realtime_status_fragment(db_path)
 
     with st.container(border=True):
         st.markdown("### ▶️ 시뮬레이션 실행")
@@ -1016,14 +1581,12 @@ def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
         with r1[3]:
             agency_filter = st.text_input("기관 (선택, 정확 일치)", key="sim_agency")
 
-        r2 = st.columns(4)
+        r2 = st.columns(3)
         with r2[0]:
             num_customers = st.slider("내 고객 수", 1, 10, 5, key="sim_num_customers")
         with r2[1]:
             num_competitors = st.slider("경쟁사 수 (top-K)", 1, 15, 10, key="sim_num_competitors")
         with r2[2]:
-            num_runs = st.slider("시뮬레이션 횟수", 100, 2000, 300, step=100, key="sim_num_runs")
-        with r2[3]:
             fee_pct = st.number_input("수수료 %", min_value=0.0, max_value=5.0,
                                        value=0.05, step=0.01, format="%.2f", key="sim_fee_pct",
                                        help="낙찰가 대비 내 수수료. 기본 0.05%.")
@@ -1078,9 +1641,8 @@ def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
                         upper_rate=analysis.upper_rate,
                         predicted_amount=analysis.recommended_amount,
                         competitors=comps,
+                        historical_cases=cases,
                         n_customers=int(num_customers),
-                        num_runs=int(num_runs),
-                        seed=42 + i,
                     )
                     reports.append({
                         "notice": notice,
@@ -1096,7 +1658,11 @@ def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
                                 "bid_rate": cb.rate,
                                 "predicted_amount": analysis.recommended_amount,
                                 "predicted_rate": analysis.blended_rate,
-                                "note": f"sim_win_rate={report.our_win_rate:.3f}",
+                                "note": (
+                                    "auto:trend-aware-quantile"
+                                    f";portfolio_win_rate={report.our_win_rate:.3f}"
+                                    f";uncertainty={report.uncertainty_score:.3f}"
+                                ),
                                 "customer_idx": cb.idx,
                             })
                 except Exception as exc:  # noqa: BLE001
@@ -1105,11 +1671,11 @@ def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
                                     text=f"{i + 1}/{len(notices)} 처리 중...")
             progress.empty()
             if persist and batch_rows:
-                save_mock_bid_batch(db_path, simulation_id, batch_rows)
-                st.success(f"완료. {len(reports)}개 공고 시뮬레이션 · 고객 입찰 {len(batch_rows)}건 저장 "
+                replace_auto_mock_bid_batch(db_path, simulation_id, batch_rows)
+                st.success(f"완료. {len(reports)}개 공고 포트폴리오 · 고객 입찰 {len(batch_rows)}건 저장 "
                              f"(simulation_id={simulation_id}).")
             else:
-                st.success(f"완료. {len(reports)}개 공고 시뮬레이션 (DB 저장 안 함).")
+                st.success(f"완료. {len(reports)}개 공고 포트폴리오 생성 (DB 저장 안 함).")
             st.session_state["sim_last_reports"] = reports
             st.session_state["sim_last_id"] = simulation_id if persist else None
 
@@ -1173,9 +1739,10 @@ def _render_sim_reports(reports: list[dict], fee_rate: float) -> None:
             "고객_최저투찰가": min(c.amount for c in rep.customers) if rep.customers else 0,
             "고객_최고투찰가": max(c.amount for c in rep.customers) if rep.customers else 0,
             "경쟁사수": len(rep.competitors),
-            "시뮬승률": rep.our_win_rate,
+            "추정 포트폴리오 승률": rep.our_win_rate,
             "최고고객#": rep.best_customer_idx or 0,
             "최고고객승률": rep.best_customer_win_rate or 0,
+            "추정 낙찰가": rep.mean_winning_amount_when_we_win or 0,
             "예상수수료(승률기반)": (rep.our_win_rate or 0) * (rep.mean_winning_amount_when_we_win or 0) * fee_rate,
             "부모통합": r.get("parent_used") or "",
         })
@@ -1186,8 +1753,9 @@ def _render_sim_reports(reports: list[dict], fee_rate: float) -> None:
         예측률=df["예측률"].map(lambda v: f"{v:.2f}%"),
         고객_최저투찰가=df["고객_최저투찰가"].map(lambda v: f"{v:,.0f}"),
         고객_최고투찰가=df["고객_최고투찰가"].map(lambda v: f"{v:,.0f}"),
-        시뮬승률=df["시뮬승률"].map(lambda v: f"{v * 100:.1f}%"),
+        **{"추정 포트폴리오 승률": df["추정 포트폴리오 승률"].map(lambda v: f"{v * 100:.1f}%")},
         최고고객승률=df["최고고객승률"].map(lambda v: f"{v * 100:.1f}%"),
+        추정_낙찰가=df["추정 낙찰가"].map(lambda v: f"{v:,.0f}"),
         **{"예상수수료(승률기반)": df["예상수수료(승률기반)"].map(lambda v: f"{v:,.0f}")},
     )
     st.dataframe(disp, hide_index=True, use_container_width=True,
@@ -1212,12 +1780,19 @@ def _render_sim_detail(entry: dict) -> None:
     rep = entry["report"]
     st.markdown(f"#### 🔍 {notice.notice_id} · {notice.agency_name}")
     cust_df = pd.DataFrame([
-        {"고객#": c.idx, "투찰률": f"{c.rate:.3f}%",
+        {"고객#": c.idx, "역할": c.role, "목표 분위수": f"{(c.target_quantile or 0) * 100:.1f}%",
+         "투찰률": f"{c.rate:.3f}%",
          "투찰금액": f"{c.amount:,.0f}원"}
         for c in rep.customers
     ])
     st.markdown("##### 내 고객 투찰 내역")
     st.dataframe(cust_df, hide_index=True, use_container_width=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("시장 중심", f"{(rep.market_center or 0):.3f}%")
+    c2.metric("최근 드리프트", f"{(rep.market_drift or 0):+.3f}%p")
+    c3.metric("불확실성", f"{rep.uncertainty_score:.3f}")
+    c4.metric("추정 포트폴리오 승률", f"{rep.our_win_rate * 100:.1f}%")
 
     comp_df = pd.DataFrame([
         {"업체": c.company_name, "사업자번호": c.biz_no,
@@ -1465,6 +2040,7 @@ def _render_mapping_detail(db_path: str, row: dict) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="G2B 입찰 예측 대시보드", layout="wide")
+    _inject_dashboard_styles()
     st.title("G2B 입찰 예측 대시보드")
     st.caption(
         "진행 중인 공고를 예측하고, 선택한 공고의 기관 과거 실적을 즉시 확인합니다."
@@ -1497,20 +2073,30 @@ def main() -> None:
         st.error(f"DB 파일을 찾을 수 없습니다: {db_path}")
         st.stop()
 
-    tab_live, tab_mock, tab_map, tab_review = st.tabs([
-        "📝 진행 중 공고", "🎯 모의 입찰", "🧩 기관 통합 관리", "📈 주간 리뷰",
-    ])
+    init_db(db_path)
 
-    with tab_live:
+    _render_operations_summary_fragment(db_path)
+    _render_monitoring_panel(db_path)
+
+    view = st.segmented_control(
+        "화면",
+        options=[
+            "📝 진행 중 공고",
+            "🎯 모의 입찰",
+            "🧩 기관 통합 관리",
+            "📈 주간 리뷰",
+        ],
+        default="📝 진행 중 공고",
+        key="main_view",
+    )
+
+    if view == "📝 진행 중 공고":
         _render_live_view(db_path, target_win_probability)
-
-    with tab_mock:
+    elif view == "🎯 모의 입찰":
         _render_mock_tab(db_path, target_win_probability)
-
-    with tab_map:
+    elif view == "🧩 기관 통합 관리":
         _render_mapping_tab(db_path)
-
-    with tab_review:
+    elif view == "📈 주간 리뷰":
         _render_review_tab(db_path, fee_rate=float(fee_pct_global) / 100.0)
 
     with st.expander("데이터 스키마 / 컬럼 설명"):
