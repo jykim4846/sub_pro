@@ -18,7 +18,10 @@
 #   AUTO_BID_CUSTOMERS default: 5
 #   AUTO_BID_TOP_K     default: 10
 #   AUTO_BID_LIMIT     default: 500 (set 0 to process all pending; heavy)
+#   AUTO_BID_SINCE_DAYS default: 14 (daily operational mode; limits auto-bid
+#                         to recent pending notices after the initial full load)
 #   AUTO_BID_TARGET_WIN default: 0.75
+#   EVALUATE_MOCK_BIDS default: 1
 #   SYNC_DEMAND_AGENCIES default: 1
 #   G2B_USER_INFO_ENDPOINT optional exact demand-agency operation URL
 #   DEMAND_AGENCY_SINCE optional YYYYMMDD or YYYYMMDDHHMM for agency sync window start
@@ -50,7 +53,9 @@ AUTO_BID_ENABLED="${AUTO_BID_ENABLED:-1}"
 AUTO_BID_CUSTOMERS="${AUTO_BID_CUSTOMERS:-5}"
 AUTO_BID_TOP_K="${AUTO_BID_TOP_K:-10}"
 AUTO_BID_LIMIT="${AUTO_BID_LIMIT:-500}"
+AUTO_BID_SINCE_DAYS="${AUTO_BID_SINCE_DAYS:-14}"
 AUTO_BID_TARGET_WIN="${AUTO_BID_TARGET_WIN:-0.75}"
+EVALUATE_MOCK_BIDS="${EVALUATE_MOCK_BIDS:-1}"
 SYNC_DEMAND_AGENCIES="${SYNC_DEMAND_AGENCIES:-1}"
 G2B_USER_INFO_ENDPOINT="${G2B_USER_INFO_ENDPOINT:-}"
 DEMAND_AGENCY_SINCE="${DEMAND_AGENCY_SINCE:-}"
@@ -89,16 +94,32 @@ LOG_FILE="${LOG_DIR}/daily-api-collect-${TS}.log"
         fi
         "${PYTHON_BIN}" "${AGENCY_ARGS[@]}" || echo "[warn] sync-demand-agencies failed"
     fi
+    if [ "${EVALUATE_MOCK_BIDS}" = "1" ]; then
+        echo "---"
+        echo "[evaluate] materializing mock-bid verdicts for today's collected results"
+        "${PYTHON_BIN}" -m g2b_bid_reco.cli evaluate-mock-bids \
+            --db-path "${DB_PATH}" \
+            --today-results-only \
+            || echo "[warn] evaluate-mock-bids failed"
+    fi
     if [ "${AUTO_BID_ENABLED}" = "1" ]; then
         echo "---"
         echo "[auto-bid] generating pending-notice portfolios"
-        "${PYTHON_BIN}" -m g2b_bid_reco.cli auto-bid-pending \
-            --db-path "${DB_PATH}" \
-            --limit "${AUTO_BID_LIMIT}" \
-            --num-customers "${AUTO_BID_CUSTOMERS}" \
-            --top-k "${AUTO_BID_TOP_K}" \
-            --target-win-probability "${AUTO_BID_TARGET_WIN}" \
-            || echo "[warn] auto-bid-pending failed"
+        AUTO_BID_ARGS=(
+            -m g2b_bid_reco.cli auto-bid-pending
+            --db-path "${DB_PATH}"
+            --limit "${AUTO_BID_LIMIT}"
+            --num-customers "${AUTO_BID_CUSTOMERS}"
+            --top-k "${AUTO_BID_TOP_K}"
+            --target-win-probability "${AUTO_BID_TARGET_WIN}"
+        )
+        # After the initial bootstrap/backfill, daily operation should touch
+        # only recent pending notices. Older pending notices were already
+        # covered by the full load and can be reprocessed explicitly if needed.
+        if [ -n "${AUTO_BID_SINCE_DAYS}" ] && [ "${AUTO_BID_SINCE_DAYS}" -gt 0 ] 2>/dev/null; then
+            AUTO_BID_ARGS+=( --since-days "${AUTO_BID_SINCE_DAYS}" )
+        fi
+        "${PYTHON_BIN}" "${AUTO_BID_ARGS[@]}" || echo "[warn] auto-bid-pending failed"
     fi
     echo "---"
     echo "[snapshot] weekly metrics"

@@ -195,6 +195,22 @@ CREATE TABLE IF NOT EXISTS notice_prediction_cache (
     analysis_notes TEXT NOT NULL DEFAULT '',
     computed_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS mock_bid_evaluations (
+    mock_id INTEGER PRIMARY KEY REFERENCES mock_bids(mock_id) ON DELETE CASCADE,
+    notice_id TEXT NOT NULL,
+    simulation_id TEXT NOT NULL DEFAULT '',
+    customer_idx INTEGER NOT NULL DEFAULT 0,
+    bid_amount REAL NOT NULL DEFAULT 0,
+    bid_rate REAL NOT NULL DEFAULT 0,
+    verdict TEXT NOT NULL DEFAULT 'pending',
+    actual_amount REAL NOT NULL DEFAULT 0,
+    actual_rate REAL NOT NULL DEFAULT 0,
+    winning_company TEXT NOT NULL DEFAULT '',
+    result_status TEXT NOT NULL DEFAULT '',
+    result_created_at TEXT,
+    evaluated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -329,6 +345,15 @@ def init_db(db_path: str | Path) -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_notice_prediction_cache_computed_at ON notice_prediction_cache(computed_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mock_bid_evaluations_notice ON mock_bid_evaluations(notice_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mock_bid_evaluations_eval_at ON mock_bid_evaluations(evaluated_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mock_bid_evaluations_verdict ON mock_bid_evaluations(verdict, evaluated_at DESC)"
         )
 
 
@@ -1370,18 +1395,40 @@ def _parent_token(agency_name: str) -> str:
     return agency_name.split(" ", 1)[0]
 
 
+def _normalized_parent_name(
+    agency_name: str,
+    top_agency_code: str,
+    top_agency_name: str,
+) -> tuple[str, str]:
+    agency_name = (agency_name or "").strip()
+    top_agency_code = (top_agency_code or "").strip()
+    top_agency_name = (top_agency_name or "").strip()
+
+    if top_agency_code and top_agency_name:
+        return top_agency_name, "api"
+    if top_agency_name and top_agency_name != agency_name:
+        return top_agency_name, "api"
+
+    token = _parent_token(agency_name)
+    if token:
+        return token, "token"
+    return "", ""
+
+
 def seed_agency_parent_mapping(
     db_path: str | Path,
     min_subunits: int = 10,
     min_parent_cases: int = 50,
     refresh: bool = False,
 ) -> dict:
-    """Populate agency_parent_mapping with first-token-based parent suggestions.
+    """Populate agency_parent_mapping with demand-agency-aware parent suggestions.
 
-    Only inserts rows for agencies belonging to a parent that (a) has at least
-    `min_subunits` distinct sub-units, (b) has at least `min_parent_cases`
-    awarded cases, and (c) whose member code prefixes are all within the safe
-    single-entity set. Existing rows are preserved unless `refresh=True`.
+    Parent grouping prefers `demand_agencies.top_agency_*` from the user API.
+    When that metadata is missing, it falls back to the legacy first-token rule.
+    Only inserts rows for parent buckets that (a) have at least `min_subunits`
+    distinct sub-units and (b) have at least `min_parent_cases` awarded cases.
+    The legacy name-token fallback also keeps the existing safe-prefix filter.
+    Existing rows are preserved unless `refresh=True`.
     """
     with connect(db_path) as conn:
         if refresh:
@@ -1390,27 +1437,35 @@ def seed_agency_parent_mapping(
         agency_stats = conn.execute(
             """
             SELECT n.agency_name,
+                   n.agency_code,
                    SUBSTR(n.agency_code,1,1) AS code1,
+                   COALESCE(d.top_agency_code, '') AS top_agency_code,
+                   COALESCE(d.top_agency_name, '') AS top_agency_name,
                    COUNT(DISTINCT n.notice_id) AS notices,
                    SUM(CASE WHEN r.bid_rate > 0 THEN 1 ELSE 0 END) AS awarded
             FROM bid_notices n
             LEFT JOIN bid_results r ON r.notice_id = n.notice_id
+            LEFT JOIN demand_agencies d ON d.agency_code = n.agency_code
             WHERE n.agency_name != ''
-            GROUP BY n.agency_name
+            GROUP BY n.agency_name, n.agency_code, d.top_agency_code, d.top_agency_name
             """
         ).fetchall()
 
-        parent_buckets: dict[str, list[sqlite3.Row]] = {}
+        parent_buckets: dict[tuple[str, str], list[sqlite3.Row]] = {}
         for row in agency_stats:
-            token = _parent_token(row["agency_name"])
-            if not token:
+            parent_name, bucket_kind = _normalized_parent_name(
+                row["agency_name"],
+                row["top_agency_code"],
+                row["top_agency_name"],
+            )
+            if not parent_name or not bucket_kind:
                 continue
-            parent_buckets.setdefault(token, []).append(row)
+            parent_buckets.setdefault((bucket_kind, parent_name), []).append(row)
 
         inserted = 0
         skipped_unsafe = 0
         skipped_small = 0
-        for parent, rows in parent_buckets.items():
+        for (bucket_kind, parent), rows in parent_buckets.items():
             if len(rows) < min_subunits:
                 skipped_small += 1
                 continue
@@ -1418,10 +1473,11 @@ def seed_agency_parent_mapping(
             if parent_awarded_total < min_parent_cases:
                 skipped_small += 1
                 continue
-            prefixes = {row["code1"] for row in rows if row["code1"]}
-            if not prefixes or not prefixes.issubset(set(_SAFE_PARENT_PREFIXES)):
-                skipped_unsafe += 1
-                continue
+            if bucket_kind == "token":
+                prefixes = {row["code1"] for row in rows if row["code1"]}
+                if not prefixes or not prefixes.issubset(set(_SAFE_PARENT_PREFIXES)):
+                    skipped_unsafe += 1
+                    continue
             for row in rows:
                 if row["agency_name"] == parent:
                     continue
@@ -2030,6 +2086,50 @@ def delete_mock_bid(db_path: str | Path, mock_id: int) -> None:
         conn.execute("DELETE FROM mock_bids WHERE mock_id = ?", (mock_id,))
 
 
+def list_mock_bids_for_notice(db_path: str | Path, notice_id: str) -> list[dict]:
+    """Return the latest simulation's mock bids for a single notice.
+
+    Rows carry notice metadata, predicted values, the actual result (when known)
+    and a verdict string so the UI can show won/lost/disqualified/pending.
+    """
+    if not notice_id:
+        return []
+    with connect(db_path) as conn:
+        latest = conn.execute(
+            "SELECT simulation_id, MAX(submitted_at) AS submitted_at "
+            "FROM mock_bids WHERE notice_id=? "
+            "GROUP BY simulation_id ORDER BY submitted_at DESC LIMIT 1",
+            (notice_id,),
+        ).fetchone()
+        if latest is None:
+            return []
+        simulation_id = latest["simulation_id"] or ""
+        rows = conn.execute(
+            """
+            SELECT m.mock_id, m.notice_id, m.simulation_id, m.customer_idx,
+                   m.bid_amount, m.bid_rate,
+                   m.predicted_amount, m.predicted_rate, m.note, m.submitted_at,
+                   n.agency_name, n.category, n.contract_method, n.region,
+                   n.base_amount, n.floor_rate, n.opened_at,
+                   r.award_amount AS actual_amount, r.bid_rate AS actual_rate,
+                   COALESCE(r.winning_company,'') AS winning_company,
+                   COALESCE(r.result_status,'') AS result_status
+            FROM mock_bids m
+            LEFT JOIN bid_notices n ON n.notice_id = m.notice_id
+            LEFT JOIN bid_results r ON r.notice_id = m.notice_id
+            WHERE m.notice_id=? AND m.simulation_id=?
+            ORDER BY m.customer_idx ASC, m.mock_id ASC
+            """,
+            (notice_id, simulation_id),
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        d["verdict"] = _evaluate_mock_bid(d)
+        out.append(d)
+    return out
+
+
 def list_mock_bids(db_path: str | Path) -> list[dict]:
     """Return mock bids joined with notice + live result to enable verdict."""
     with connect(db_path) as conn:
@@ -2070,6 +2170,125 @@ def _evaluate_mock_bid(row: dict) -> str:
     if my_amount < actual_amount:
         return "won"
     return "lost"
+
+
+def refresh_mock_bid_evaluations(
+    db_path: str | Path,
+    *,
+    today_results_only: bool = False,
+    simulation_id: str | None = None,
+) -> dict:
+    """Materialize current mock-bid verdicts into a dedicated table.
+
+    This keeps the evaluation logic identical to `_evaluate_mock_bid()` while
+    making daily analysis cheap and stable. Only mock bids linked to notices
+    with an actual recorded result are persisted here; pending rows stay in
+    `mock_bids` and become materialized once results arrive.
+    """
+    with connect(db_path) as conn:
+        filters = [
+            "r.award_amount > 0",
+            "r.bid_rate > 0",
+        ]
+        params: list = []
+        if today_results_only:
+            filters.append("date(r.created_at, 'localtime') = date('now', 'localtime')")
+        if simulation_id:
+            filters.append("m.simulation_id = ?")
+            params.append(simulation_id)
+        where_sql = " AND ".join(filters)
+        rows = conn.execute(
+            f"""
+            SELECT m.mock_id, m.notice_id, m.simulation_id, m.customer_idx,
+                   m.bid_amount, m.bid_rate,
+                   n.floor_rate,
+                   r.award_amount AS actual_amount, r.bid_rate AS actual_rate,
+                   COALESCE(r.winning_company,'') AS winning_company,
+                   COALESCE(r.result_status,'') AS result_status,
+                   r.created_at AS result_created_at
+            FROM mock_bids m
+            JOIN bid_results r ON r.notice_id = m.notice_id
+            LEFT JOIN bid_notices n ON n.notice_id = m.notice_id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchall()
+
+    evaluations: list[tuple] = []
+    verdict_counts = {"won": 0, "lost": 0, "pending": 0, "disqualified": 0}
+    notice_ids: set[str] = set()
+    for row in rows:
+        record = dict(row)
+        verdict = _evaluate_mock_bid(record)
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+        notice_ids.add(str(record["notice_id"]))
+        evaluations.append(
+            (
+                int(record["mock_id"]),
+                str(record["notice_id"]),
+                str(record["simulation_id"] or ""),
+                int(record["customer_idx"] or 0),
+                float(record["bid_amount"] or 0),
+                float(record["bid_rate"] or 0),
+                verdict,
+                float(record["actual_amount"] or 0),
+                float(record["actual_rate"] or 0),
+                str(record["winning_company"] or ""),
+                str(record["result_status"] or ""),
+                record["result_created_at"],
+            )
+        )
+
+    def _action(conn: sqlite3.Connection) -> None:
+        if today_results_only and not simulation_id:
+            conn.execute(
+                """
+                DELETE FROM mock_bid_evaluations
+                WHERE date(result_created_at, 'localtime') = date('now', 'localtime')
+                """
+            )
+        elif simulation_id:
+            conn.execute(
+                "DELETE FROM mock_bid_evaluations WHERE simulation_id = ?",
+                (simulation_id,),
+            )
+        if evaluations:
+            conn.executemany(
+                """
+                INSERT INTO mock_bid_evaluations (
+                    mock_id, notice_id, simulation_id, customer_idx,
+                    bid_amount, bid_rate, verdict,
+                    actual_amount, actual_rate, winning_company, result_status,
+                    result_created_at, evaluated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(mock_id) DO UPDATE SET
+                    notice_id = excluded.notice_id,
+                    simulation_id = excluded.simulation_id,
+                    customer_idx = excluded.customer_idx,
+                    bid_amount = excluded.bid_amount,
+                    bid_rate = excluded.bid_rate,
+                    verdict = excluded.verdict,
+                    actual_amount = excluded.actual_amount,
+                    actual_rate = excluded.actual_rate,
+                    winning_company = excluded.winning_company,
+                    result_status = excluded.result_status,
+                    result_created_at = excluded.result_created_at,
+                    evaluated_at = CURRENT_TIMESTAMP
+                """,
+                evaluations,
+            )
+
+    _run_write_with_retry(db_path, _action)
+    return {
+        "evaluated_mock_bids": len(evaluations),
+        "evaluated_notices": len(notice_ids),
+        "won": verdict_counts.get("won", 0),
+        "lost": verdict_counts.get("lost", 0),
+        "pending": verdict_counts.get("pending", 0),
+        "disqualified": verdict_counts.get("disqualified", 0),
+        "today_results_only": bool(today_results_only),
+        "simulation_id": simulation_id or "",
+    }
 
 
 def resolve_adaptive_agencies(
@@ -2125,6 +2344,122 @@ def resolve_adaptive_agencies(
         names.add(mapping["parent_name"])
         names.add(agency_name)
     return (sorted(names), mapping["parent_name"])
+
+
+AGENCY_SHRINKAGE_K = 10
+
+
+def get_agency_parent_pool(
+    db_path: str | Path,
+    agency_name: str,
+) -> tuple[str | None, frozenset[str]]:
+    """Return (parent_name, sibling_pool) for an approved parent mapping.
+
+    The sibling pool excludes the agency itself; feed it to
+    `AgencyRangeAnalyzer(parent_pool_agencies=...)` to restrict peer cases to
+    the parent group.
+    """
+    if not agency_name:
+        return (None, frozenset())
+    with connect(db_path) as conn:
+        mapping = conn.execute(
+            "SELECT parent_name FROM agency_parent_mapping "
+            "WHERE agency_name=? AND status='approved'",
+            (agency_name,),
+        ).fetchone()
+        parent_name = (
+            mapping["parent_name"] if mapping and mapping["parent_name"] else None
+        )
+        if not parent_name:
+            return (None, frozenset())
+        sibling_rows = conn.execute(
+            "SELECT agency_name FROM agency_parent_mapping "
+            "WHERE parent_name=? AND status='approved'",
+            (parent_name,),
+        ).fetchall()
+    pool = {row["agency_name"] for row in sibling_rows}
+    pool.add(parent_name)
+    pool.discard(agency_name)
+    return (parent_name, frozenset(pool))
+
+
+def load_cases_with_shrinkage(
+    db_path: str | Path,
+    agency_name: str,
+    *,
+    category: str | None = None,
+    contract_method: str | None = None,
+    cutoff_opened_at: str | None = None,
+    exclude_notice_id: str | None = None,
+    k: int = AGENCY_SHRINKAGE_K,
+) -> tuple[list, dict]:
+    """Blend sub-agency history with its parent pool via empirical-Bayes shrinkage.
+
+    The returned case list contains every own case plus up to `k` most recent
+    parent-pool cases. Because the downstream analyzer averages cases uniformly,
+    the resulting mean ≈ `(n_sub*mean_sub + k_eff*mean_parent) / (n_sub + k_eff)`,
+    where `k_eff = min(k, n_parent_available)`.
+    """
+    meta = {
+        "n_sub": 0,
+        "n_parent_anchor": 0,
+        "n_parent_available": 0,
+        "parent_name": None,
+        "k": int(k),
+        "w_sub": 1.0,
+    }
+    if not agency_name:
+        return ([], meta)
+
+    own = load_cases_for_agencies(
+        db_path,
+        [agency_name],
+        category=category,
+        contract_method=contract_method,
+        cutoff_opened_at=cutoff_opened_at,
+        exclude_notice_id=exclude_notice_id,
+    )
+    meta["n_sub"] = len(own)
+
+    with connect(db_path) as conn:
+        mapping = conn.execute(
+            "SELECT parent_name FROM agency_parent_mapping "
+            "WHERE agency_name=? AND status='approved'",
+            (agency_name,),
+        ).fetchone()
+    parent_name = mapping["parent_name"] if mapping and mapping["parent_name"] else None
+    if not parent_name or k <= 0:
+        return (own, meta)
+
+    with connect(db_path) as conn:
+        sibling_rows = conn.execute(
+            "SELECT agency_name FROM agency_parent_mapping "
+            "WHERE parent_name=? AND status='approved'",
+            (parent_name,),
+        ).fetchall()
+    pool_names = {row["agency_name"] for row in sibling_rows}
+    pool_names.add(parent_name)
+    pool_names.discard(agency_name)
+    meta["parent_name"] = parent_name
+    if not pool_names:
+        return (own, meta)
+
+    parent_pool = load_cases_for_agencies(
+        db_path,
+        sorted(pool_names),
+        category=category,
+        contract_method=contract_method,
+        cutoff_opened_at=cutoff_opened_at,
+        exclude_notice_id=exclude_notice_id,
+    )
+    own_ids = {c.notice_id for c in own}
+    parent_pool = [c for c in parent_pool if c.notice_id not in own_ids]
+    anchor = parent_pool[: int(k)]
+    meta["n_parent_anchor"] = len(anchor)
+    meta["n_parent_available"] = len(parent_pool)
+    denom = len(own) + len(anchor)
+    meta["w_sub"] = (len(own) / denom) if denom > 0 else 0.0
+    return (own + anchor, meta)
 
 
 def load_cases_for_agencies(
@@ -2511,14 +2846,11 @@ def get_operations_summary(
         ).fetchone()[0]
         evaluated_today = conn.execute(
             f"""
-            SELECT COUNT(DISTINCT m.notice_id)
-            FROM mock_bids m
-            JOIN bid_notices n ON n.notice_id = m.notice_id
-            JOIN bid_results r ON r.notice_id = m.notice_id
+            SELECT COUNT(DISTINCT e.notice_id)
+            FROM mock_bid_evaluations e
+            JOIN bid_notices n ON n.notice_id = e.notice_id
             WHERE {where_sql}
-              AND r.award_amount > 0
-              AND r.bid_rate > 0
-              AND date(r.created_at, 'localtime') = date('now', 'localtime')
+              AND date(e.evaluated_at, 'localtime') = date('now', 'localtime')
             """,
             params,
         ).fetchone()[0]
@@ -2652,13 +2984,14 @@ def get_monitoring_overview(db_path: str | Path) -> dict:
             )
         unresolved_results = conn.execute(
             """
-            SELECT COUNT(*)
+            SELECT COUNT(DISTINCT r.notice_id)
             FROM bid_results r
             LEFT JOIN mock_bids m ON m.notice_id = r.notice_id
+            LEFT JOIN mock_bid_evaluations e ON e.notice_id = r.notice_id
             WHERE r.award_amount > 0
               AND r.bid_rate > 0
               AND date(r.created_at, 'localtime') = date('now', 'localtime')
-              AND m.notice_id IS NULL
+              AND (m.notice_id IS NULL OR e.notice_id IS NULL)
             """
         ).fetchone()[0]
     runs = list_latest_automation_runs(

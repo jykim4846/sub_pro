@@ -640,30 +640,39 @@ class PPSCollector:
             agency_name=agency_name,
             top_agency_code=str(_first_non_empty(
                 item,
-                ["topInsttCd", "upperInsttCd", "hghrInsttCd", "topDminsttCd"],
+                [
+                    "topInsttCd", "upperInsttCd", "hghrInsttCd", "topDminsttCd",
+                    "toplvlInsttCd",
+                ],
                 "",
             ) or ""),
             top_agency_name=_first_non_empty(
                 item,
-                ["topInsttNm", "upperInsttNm", "hghrInsttNm", "topDminsttNm"],
+                [
+                    "topInsttNm", "upperInsttNm", "hghrInsttNm", "topDminsttNm",
+                    "toplvlInsttNm",
+                ],
                 "",
             ) or "",
             jurisdiction_type=_first_non_empty(
                 item,
-                ["jurirnoDivNm", "psitnDivNm", "sptDvsNm", "psitnNm"],
+                [
+                    "jurirnoDivNm", "psitnDivNm", "sptDvsNm", "psitnNm",
+                    "jrsdctnDivNm",
+                ],
                 "",
             ) or "",
             address=_first_non_empty(
                 item,
-                ["insttAddr", "dminsttAddr", "dmndInsttAddr", "orgAddr"],
+                ["insttAddr", "dminsttAddr", "dmndInsttAddr", "orgAddr", "adrs"],
                 "",
             ) or "",
             road_address=_first_non_empty(
                 item,
-                ["insttRoadNmAddr", "roadNmAddr", "rnAddr"],
+                ["insttRoadNmAddr", "roadNmAddr", "rnAddr", "adrs"],
                 "",
             ) or "",
-            postal_code=str(_first_non_empty(item, ["zipNo", "postNo"], "") or ""),
+            postal_code=str(_first_non_empty(item, ["zipNo", "postNo", "zip"], "") or ""),
             source="user-api",
             raw_json=json.dumps(item, ensure_ascii=False, separators=(",", ":")),
         )

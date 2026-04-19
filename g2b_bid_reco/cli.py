@@ -23,6 +23,7 @@ from .api import (
 from .backtest import build_backtest_report, run_batch_backtest
 from .csv_import import import_contract_history_csvs
 from .db import (
+    AGENCY_SHRINKAGE_K,
     bump_automation_daily_stats,
     connect,
     create_run_task,
@@ -40,6 +41,7 @@ from .db import (
     load_historical_cases_for_notice,
     load_pending_notices_for_prediction,
     replace_auto_mock_bid_batch,
+    refresh_mock_bid_evaluations,
     resolve_adaptive_agencies,
     save_mock_bid_batch,
     seed_demand_agencies_from_notices,
@@ -219,6 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync_agency_parser.add_argument("--since")
     sync_agency_parser.add_argument("--until")
     sync_agency_parser.add_argument("--print-candidates", action="store_true")
+
+    eval_parser = subparsers.add_parser(
+        "evaluate-mock-bids",
+        help="Materialize mock-bid verdicts into a dedicated evaluation table.",
+    )
+    eval_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    eval_parser.add_argument("--today-results-only", action="store_true")
+    eval_parser.add_argument("--simulation-id")
 
     return parser
 
@@ -479,6 +489,16 @@ def main() -> int:
             )
             raise
 
+    if args.command == "evaluate-mock-bids":
+        init_db(args.db_path)
+        payload = refresh_mock_bid_evaluations(
+            args.db_path,
+            today_results_only=bool(args.today_results_only),
+            simulation_id=(args.simulation_id or "").strip() or None,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
     parser.error("Unknown command")
     return 2
 
@@ -666,6 +686,21 @@ def _auto_bid_scope_worker(payload: dict) -> dict:
     ]
     timings["preload_s"] = perf_counter() - preload_started
 
+    # Approved parent-agency index, used to narrow peer cases to the sibling
+    # group so shrinkage pulls toward the parent-agency trend instead of the
+    # category-wide mean.
+    agency_to_parent: dict[str, str] = {}
+    parent_to_children: dict[str, set[str]] = {}
+    with connect(db_path) as _map_conn:
+        for row in _map_conn.execute(
+            "SELECT agency_name, parent_name FROM agency_parent_mapping "
+            "WHERE status='approved' AND parent_name != ''"
+        ):
+            agency_to_parent[row["agency_name"]] = row["parent_name"]
+            parent_to_children.setdefault(row["parent_name"], set()).add(
+                row["agency_name"]
+            )
+
     group = sorted(group, key=lambda item: ((item.opened_at or ""), item.notice_id))
     prior_cases: list = []
     prior_valid_rates_opened_asc: list[float] = []
@@ -690,7 +725,21 @@ def _auto_bid_scope_worker(payload: dict) -> dict:
             timings["case_prep_s"] += perf_counter() - case_started
 
             predict_started = perf_counter()
-            analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_prob)
+            parent_name = agency_to_parent.get(notice.agency_name)
+            parent_pool: frozenset[str] | None = None
+            if parent_name:
+                children = parent_to_children.get(parent_name, set())
+                pool = set(children)
+                pool.add(parent_name)
+                pool.discard(notice.agency_name)
+                parent_pool = frozenset(pool) if pool else None
+            analyzer = AgencyRangeAnalyzer(
+                cases,
+                target_win_probability=target_win_prob,
+                prior_strength=AGENCY_SHRINKAGE_K if parent_name else 4.0,
+                parent_pool_agencies=parent_pool,
+                parent_name=parent_name,
+            )
             prediction = NoticePredictor(analyzer).predict(notice)
             analysis = prediction.analysis
             timings["predict_s"] += perf_counter() - predict_started
@@ -718,7 +767,7 @@ def _auto_bid_scope_worker(payload: dict) -> dict:
                     "best_customer_idx": report.best_customer_idx,
                     "market_drift": report.market_drift,
                     "uncertainty_score": report.uncertainty_score,
-                    "parent_used": "",
+                    "parent_used": parent_name or "",
                 }
             )
             for customer in report.customers:

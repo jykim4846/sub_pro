@@ -9,6 +9,8 @@ Install the extras once:
 from __future__ import annotations
 
 import os
+import statistics
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -42,11 +44,14 @@ from g2b_bid_reco.db import (
     list_simulation_ids,
     list_suggestions,
     load_backtestable_notices_for_agency,
+    list_mock_bids_for_notice,
     load_cases_for_agencies,
+    load_cases_with_shrinkage,
     load_historical_cases_for_notice,
     load_pending_notices_for_prediction,
-    resolve_adaptive_agencies,
+    get_agency_parent_pool,
     revenue_summary,
+    AGENCY_SHRINKAGE_K,
     replace_auto_mock_bid_batch,
     seed_agency_parent_mapping,
     take_weekly_snapshot,
@@ -564,28 +569,54 @@ def _resolve_default_db_path() -> str:
     local_path = Path("data/bids.db")
     runner_path = Path.home() / "Library/Application Support/sub_pro-runner/data/bids.db"
 
-    def _has_running_auto_bid(path: Path) -> bool:
+    def _latest_run_meta(path: Path) -> tuple[bool, pd.Timestamp]:
         if not path.exists():
-            return False
+            return False, pd.NaT
         try:
             with connect(path) as conn:
                 row = conn.execute(
                     """
-                    SELECT 1
+                    SELECT status, COALESCE(updated_at, started_at) AS heartbeat
                     FROM automation_runs
-                    WHERE kind = 'auto_bid_pending' AND status = 'running'
-                    ORDER BY COALESCE(updated_at, started_at) DESC
+                    ORDER BY
+                        CASE
+                            WHEN status = 'running'
+                                 AND COALESCE(updated_at, started_at) >= datetime('now', '-3 minutes')
+                            THEN 0
+                            ELSE 1
+                        END,
+                        COALESCE(updated_at, started_at) DESC
                     LIMIT 1
                     """
                 ).fetchone()
-            return row is not None
+            if not row:
+                return False, pd.NaT
+            heartbeat = pd.to_datetime(row["heartbeat"], errors="coerce")
+            is_fresh_running = (
+                str(row["status"] or "") == "running"
+                and not pd.isna(heartbeat)
+                and (pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None) - heartbeat).total_seconds() <= 180
+            )
+            return is_fresh_running, heartbeat
         except Exception:
-            return False
+            return False, pd.NaT
 
-    if _has_running_auto_bid(local_path):
+    local_active, local_heartbeat = _latest_run_meta(local_path)
+    runner_active, runner_heartbeat = _latest_run_meta(runner_path)
+
+    # Prefer the DB that has any fresh running automation run. The dashboard
+    # should follow collect/sync/auto-bid activity, not only auto_bid_pending.
+    if local_active and not runner_active:
         return str(local_path)
-    if _has_running_auto_bid(runner_path):
+    if runner_active and not local_active:
         return str(runner_path)
+    if local_active and runner_active:
+        return str(local_path if local_heartbeat >= runner_heartbeat else runner_path)
+
+    # If nothing is actively running, follow the DB with the most recent
+    # automation heartbeat so today's collection results are visible by default.
+    if not pd.isna(local_heartbeat) and not pd.isna(runner_heartbeat):
+        return str(local_path if local_heartbeat >= runner_heartbeat else runner_path)
     if runner_path.exists():
         return str(runner_path)
     return str(local_path)
@@ -621,17 +652,46 @@ def _run_prediction(
     actual: ActualAwardOutcome,
     target_win_probability: float,
 ):
-    cases, parent_used = _load_cases_adaptive(
+    cases, meta = _load_cases_adaptive(
         db_path, notice.notice_id, notice.agency_name, notice.category,
         notice.contract_method, notice.opened_at,
     )
-    analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
+    analyzer = _build_analyzer(cases, meta, target_win_probability)
     prediction = NoticePredictor(analyzer).predict(notice)
-    if parent_used:
-        prediction.analysis.notes.append(
-            f"sparse-agency fallback: 부모 '{parent_used}'로 확장된 풀로 예측했습니다."
-        )
+    _annotate_shrinkage_note(prediction.analysis.notes, meta)
     return prediction, build_backtest_report(prediction, actual)
+
+
+def _annotate_shrinkage_note(notes: list[str], meta: dict) -> None:
+    parent = meta.get("parent_name")
+    if not parent:
+        return
+    n_sub = int(meta.get("n_sub") or 0)
+    n_pool = int(meta.get("n_parent_pool") or 0)
+    k = int(meta.get("k") or AGENCY_SHRINKAGE_K)
+    w_sub = float(meta.get("w_sub") or 0.0)
+    notes.append(
+        f"shrinkage blend: 하위 {n_sub}건 + 상위 '{parent}' 그룹 {n_pool}건 "
+        f"(K={k}, 자체 비중 {w_sub:.0%})."
+    )
+
+
+def _build_analyzer(
+    cases,
+    meta: dict,
+    target_win_probability: float,
+):
+    """Construct an AgencyRangeAnalyzer wired with the parent-pool shrinkage."""
+    parent_name = meta.get("parent_name") if meta else None
+    pool = meta.get("parent_pool_agencies") if meta else None
+    prior_strength = int(meta.get("k") or AGENCY_SHRINKAGE_K) if parent_name else 4.0
+    return AgencyRangeAnalyzer(
+        cases,
+        target_win_probability=target_win_probability,
+        prior_strength=prior_strength,
+        parent_pool_agencies=pool,
+        parent_name=parent_name,
+    )
 
 
 def _load_cases_adaptive(
@@ -642,30 +702,28 @@ def _load_cases_adaptive(
     contract_method: str,
     opened_at,
 ):
-    agency_list, parent_used = resolve_adaptive_agencies(
-        db_path, agency_name, category=category, contract_method=contract_method,
-    )
-    if parent_used:
-        cases = load_cases_for_agencies(
-            db_path, agency_list,
-            category=category, contract_method=contract_method,
-            cutoff_opened_at=opened_at, exclude_notice_id=notice_id,
-        )
-        # Fallback: expand to full category+method peer pool for non-agency peers.
-        peer = load_historical_cases_for_notice(
-            db_path, notice_id, opened_at, category=category, contract_method=contract_method,
-        )
-        # Merge: include both (dedupe by notice_id)
-        seen = {c.notice_id for c in cases}
-        for c in peer:
-            if c.notice_id not in seen:
-                cases.append(c)
-        return cases, parent_used
+    """Return (cases, meta) where meta describes the sub↔parent shrinkage blend.
+
+    `cases` is the scope-wide peer pool; the analyzer filters it down to
+    sibling-group peers when meta["parent_pool_agencies"] is present.
+    """
     cases = load_historical_cases_for_notice(
         db_path, notice_id, opened_at,
         category=category, contract_method=contract_method,
     )
-    return cases, None
+    parent_name, pool = get_agency_parent_pool(db_path, agency_name)
+    n_sub = sum(1 for c in cases if c.agency_name == agency_name)
+    n_pool = sum(1 for c in cases if c.agency_name in pool) if pool else 0
+    denom = n_sub + AGENCY_SHRINKAGE_K
+    meta = {
+        "parent_name": parent_name,
+        "parent_pool_agencies": pool if parent_name else None,
+        "n_sub": n_sub,
+        "n_parent_pool": n_pool,
+        "k": AGENCY_SHRINKAGE_K,
+        "w_sub": (n_sub / denom) if (parent_name and denom > 0) else 1.0,
+    }
+    return cases, meta
 
 
 def _win_possible(report, floor_rate: float | None) -> bool:
@@ -972,16 +1030,13 @@ def _compute_and_store_notice_prediction(
     notice: BidNoticeSnapshot,
     target_win_probability: float,
 ) -> dict:
-    cases, parent_used = _load_cases_adaptive(
+    cases, meta = _load_cases_adaptive(
         db_path, notice.notice_id, notice.agency_name, notice.category,
         notice.contract_method, notice.opened_at,
     )
-    analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
+    analyzer = _build_analyzer(cases, meta, target_win_probability)
     prediction = NoticePredictor(analyzer).predict(notice)
-    if parent_used:
-        prediction.analysis.notes.append(
-            f"sparse-agency fallback: 부모 '{parent_used}'로 확장된 풀로 예측했습니다."
-        )
+    _annotate_shrinkage_note(prediction.analysis.notes, meta)
     analysis = prediction.analysis
     notes_text = "\n".join(analysis.notes)
     upsert_notice_prediction_cache(
@@ -997,7 +1052,7 @@ def _compute_and_store_notice_prediction(
         agency_cases=analysis.agency_case_count,
         peer_cases=analysis.peer_case_count,
         lookback_years_used=analysis.lookback_years_used,
-        parent_used=parent_used,
+        parent_used=meta.get("parent_name"),
         analysis_notes=notes_text,
     )
     cached = get_cached_notice_prediction(db_path, notice, target_win_probability)
@@ -1014,10 +1069,188 @@ def _cache_status_label(value: str) -> str:
     }.get(str(value or ""), "미계산")
 
 
+_VERDICT_LABEL = {
+    "won": "🟢 낙찰",
+    "lost": "🔴 패찰",
+    "disqualified": "⚫ 실격",
+    "pending": "⏳ 대기",
+}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _notice_detail_bundle(
+    db_path: str,
+    notice_id: str,
+    target_win_probability: float,
+) -> dict | None:
+    """Cached bundle for the inline detail panel.
+
+    All four reads (notice snapshot, prediction cache, latest mock bids,
+    top winners) stay fresh within the daily batch cadence, so caching keeps
+    click responses near-instant without a DB roundtrip.
+    """
+    notice = get_notice_snapshot(db_path, notice_id)
+    if notice is None:
+        return None
+    prediction = get_cached_notice_prediction(db_path, notice, target_win_probability)
+    mock_rows = list_mock_bids_for_notice(db_path, notice_id)
+    winners = top_winners_for_scope(
+        db_path,
+        notice.agency_name,
+        notice.category,
+        notice.contract_method,
+        limit=10,
+        base_amount=notice.base_amount,
+    )
+    return {
+        "notice": notice,
+        "prediction": prediction,
+        "mock_rows": mock_rows,
+        "winners": winners,
+    }
+
+
+def _render_notice_inline_detail(
+    db_path: str,
+    notice_id: str,
+    row: dict,
+    target_win_probability: float,
+) -> None:
+    """Expanded panel shown above the notice table when a row is selected."""
+    bundle = _notice_detail_bundle(db_path, notice_id, target_win_probability)
+    if bundle is None:
+        st.warning("공고 정보를 불러오지 못했습니다.")
+        return
+    notice = bundle["notice"]
+    cached = bundle["prediction"]
+    mock_rows = bundle["mock_rows"]
+    winners = bundle["winners"]
+    st.caption(
+        f"계약방법 {notice.contract_method} · 구분 {_humanize_category(notice.category)} · "
+        f"예산 {_format_amount(notice.base_amount)}원 · "
+        f"[나라장터 공고 열기]({_build_g2b_detail_url(notice.notice_id, notice.category)})"
+    )
+
+    button_label = "예측 다시 계산" if cached else "이 공고 예측 계산"
+    if st.button(button_label, key=f"compute_notice_prediction_{notice_id}", type="primary"):
+        with st.spinner("선택한 공고의 예측을 계산하고 저장하는 중..."):
+            cached = _compute_and_store_notice_prediction(db_path, notice, target_win_probability)
+        _load_pending_notice_rows.clear()
+        _notice_detail_bundle.clear()
+        st.success("예측 결과를 저장했습니다.")
+        st.rerun()
+
+    if cached is None:
+        st.info("저장된 예측 결과가 없습니다. 위 버튼을 눌러 이 공고만 계산하세요.")
+    else:
+        info1, info2, info3, info4 = st.columns(4)
+        info1.metric("예측 투찰가", _format_amount(cached.get("predicted_amount")))
+        info2.metric("예측률", f"{_format_rate(cached.get('predicted_rate'))}%")
+        info3.metric("추정 낙찰확률", _format_pct(cached.get("estimated_win_probability")))
+        info4.metric("계산시각", str(cached.get("computed_at") or "–"))
+        sub1, sub2, sub3, sub4 = st.columns(4)
+        sub1.metric("하한율", f"{_format_rate(notice.floor_rate)}%")
+        sub2.metric("신뢰도", str(cached.get("confidence") or "–"))
+        sub3.metric("기관사례", f"{int(cached.get('agency_cases') or 0):,}건")
+        sub4.metric("peer사례", f"{int(cached.get('peer_cases') or 0):,}건")
+        if cached.get("analysis_notes"):
+            st.caption(str(cached["analysis_notes"]).replace("\n", "  \n"))
+
+    st.markdown("**🤖 자동 모의입찰**")
+    if not mock_rows:
+        st.info("이 공고에 대한 자동 모의입찰이 아직 생성되지 않았습니다.")
+    else:
+        sim_id = str(mock_rows[0].get("simulation_id") or "")
+        submitted = str(mock_rows[0].get("submitted_at") or "")
+        verdict_counts = Counter(r.get("verdict") or "pending" for r in mock_rows)
+        verdict_summary = " · ".join(
+            f"{_VERDICT_LABEL.get(v, v)} {n}명" for v, n in verdict_counts.most_common()
+        )
+        st.caption(
+            f"simulation_id=`{sim_id}` · 생성시각 {submitted} · "
+            f"고객 {len(mock_rows)}명 · {verdict_summary}"
+        )
+        mock_df = pd.DataFrame(
+            [
+                {
+                    "고객": int(r.get("customer_idx") or 0),
+                    "투찰가": _format_amount(r.get("bid_amount")),
+                    "투찰률(%)": _format_rate(r.get("bid_rate")),
+                    "예측가": _format_amount(r.get("predicted_amount")),
+                    "예측률(%)": _format_rate(r.get("predicted_rate")),
+                    "결과": _VERDICT_LABEL.get(r.get("verdict") or "pending", "–"),
+                    "메모": str(r.get("note") or ""),
+                }
+                for r in mock_rows
+            ]
+        )
+        st.dataframe(mock_df, hide_index=True, use_container_width=True)
+
+    st.markdown("**🏢 동일 스코프 상위 낙찰사**")
+    if not winners:
+        st.info("동일 스코프(구분·계약방법·예산 범위)에서 낙찰 이력이 있는 업체가 없습니다.")
+    else:
+        winners_df = pd.DataFrame(
+            [
+                {
+                    "업체": w.get("company_name") or "–",
+                    "사업자번호": w.get("biz_no") or "–",
+                    "낙찰 건수": int(w.get("wins") or 0),
+                    "낙찰률 중앙값(%)": (
+                        f"{statistics.median(w['rates']):.2f}" if w.get("rates") else "–"
+                    ),
+                    "최저(%)": (
+                        f"{min(w['rates']):.2f}" if w.get("rates") else "–"
+                    ),
+                    "최고(%)": (
+                        f"{max(w['rates']):.2f}" if w.get("rates") else "–"
+                    ),
+                }
+                for w in winners
+            ]
+        )
+        st.dataframe(winners_df, hide_index=True, use_container_width=True)
+
+        all_rates = [rate for w in winners for rate in (w.get("rates") or [])]
+        our_rates = (
+            [float(r.get("bid_rate") or 0) for r in mock_rows if r.get("bid_rate")]
+            if mock_rows
+            else []
+        )
+        if all_rates:
+            fig = go.Figure()
+            fig.add_trace(
+                go.Histogram(
+                    x=all_rates,
+                    nbinsx=30,
+                    name="상위 업체 낙찰률 분포",
+                    marker_color="#4C78A8",
+                    opacity=0.75,
+                )
+            )
+            for rate in our_rates:
+                fig.add_vline(
+                    x=rate,
+                    line_width=2,
+                    line_dash="dash",
+                    line_color="#E45756",
+                    annotation_text=f"{rate:.2f}",
+                    annotation_position="top",
+                )
+            fig.update_layout(
+                height=260,
+                margin=dict(l=10, r=10, t=30, b=10),
+                xaxis_title="낙찰률(%)",
+                yaxis_title="빈도",
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+
 def _render_live_view(db_path: str, target_win_probability: float) -> None:
     st.subheader("진행 중 / 낙찰 미확정 공고")
     st.caption(
-        "진행 중 공고 목록은 즉시 불러오고, 선택한 공고만 예측 계산합니다. "
+        "공고 행을 클릭하면 표 위에 상세·자동 모의입찰 내역이 펼쳐집니다. "
         "저장된 결과는 새 데이터가 적재되기 전까지 재사용됩니다."
     )
 
@@ -1047,7 +1280,7 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
                 value=200,
                 step=10,
                 key="live_limit",
-                help="목록 조회는 빠르지만, 표 가독성을 위해 처음엔 100~200 정도를 권장합니다.",
+                help="표는 빠르게 불러오지만, 가독성을 위해 처음엔 100~200 정도를 권장합니다.",
             )
 
         agency_filter = st.text_input(
@@ -1103,11 +1336,16 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
         "추정 낙찰확률", "신뢰도", "기관사례", "peer사례",
     ]
 
+    # Render selected-row detail ABOVE the table so the click and the expanded
+    # panel stay close in the viewport. Streamlit can't insert the detail
+    # inline between rows, so we keep it pinned at the top when a row is
+    # selected. The table height is bounded so scrolling stays local.
+    detail_slot = st.container()
     selection_event = st.dataframe(
         display,
         hide_index=True,
         use_container_width=True,
-        height=min(700, 52 + 35 * max(1, len(display))),
+        height=min(500, 52 + 35 * max(1, len(display))),
         on_select="rerun",
         selection_mode="single-row",
         key="live_notice_table",
@@ -1119,68 +1357,20 @@ def _render_live_view(db_path: str, target_win_probability: float) -> None:
     except Exception:
         selected_indices = []
 
-    if not selected_indices:
-        st.info("위 표에서 공고 행을 클릭하면 저장된 결과를 확인하거나 해당 공고만 계산할 수 있습니다.")
-        return
-
-    selected_row = df.iloc[int(selected_indices[0])].to_dict()
-    notice = get_notice_snapshot(db_path, str(selected_row["notice_id"]))
-    if notice is None:
-        st.warning("선택한 공고 정보를 불러오지 못했습니다.")
-        return
-
-    cached = get_cached_notice_prediction(db_path, notice, target_win_probability)
-
-    st.markdown("---")
-    opened = pd.to_datetime(notice.opened_at, errors="coerce")
-    opened_label = opened.strftime("%Y-%m-%d") if not pd.isna(opened) else str(notice.opened_at or "–")
-    top1, top2, top3, top4 = st.columns(4)
-    top1.metric("공고번호", notice.notice_id)
-    top2.metric("기관", notice.agency_name)
-    top3.metric("개찰일", opened_label)
-    top4.metric("계산 상태", _cache_status_label(selected_row.get("cache_status")))
-    st.caption(
-        f"계약방법 {notice.contract_method} · 구분 {_humanize_category(notice.category)} · "
-        f"예산 {_format_amount(notice.base_amount)}원 · "
-        f"[나라장터 공고 열기]({_build_g2b_detail_url(notice.notice_id, notice.category)})"
-    )
-
-    button_label = "예측 다시 계산" if cached else "이 공고 예측 계산"
-    if st.button(button_label, key=f"compute_notice_prediction_{notice.notice_id}", type="primary"):
-        with st.spinner("선택한 공고의 예측을 계산하고 저장하는 중..."):
-            cached = _compute_and_store_notice_prediction(db_path, notice, target_win_probability)
-        _load_pending_notice_rows.clear()
-        st.success("예측 결과를 저장했습니다.")
-        st.rerun()
-
-    if cached is None:
-        st.info("저장된 예측 결과가 없습니다. 위 버튼을 눌러 이 공고만 계산하세요.")
-        return
-
-    info1, info2, info3, info4 = st.columns(4)
-    info1.metric("예측 투찰가", _format_amount(cached.get("predicted_amount")))
-    info2.metric("예측률", f"{_format_rate(cached.get('predicted_rate'))}%")
-    info3.metric("추정 낙찰확률", _format_pct(cached.get("estimated_win_probability")))
-    info4.metric("계산시각", str(cached.get("computed_at") or "–"))
-    sub1, sub2, sub3, sub4 = st.columns(4)
-    sub1.metric("하한율", f"{_format_rate(notice.floor_rate)}%")
-    sub2.metric("신뢰도", str(cached.get("confidence") or "–"))
-    sub3.metric("기관사례", f"{int(cached.get('agency_cases') or 0):,}건")
-    sub4.metric("peer사례", f"{int(cached.get('peer_cases') or 0):,}건")
-    if cached.get("analysis_notes"):
-        st.caption(str(cached["analysis_notes"]).replace("\n", "  \n"))
-
-    detail_row = {
-        "opened_at": opened,
-        "notice_id": notice.notice_id,
-        "agency_name": notice.agency_name,
-        "contract_method": notice.contract_method,
-        "base_amount": notice.base_amount,
-        "predicted_amount": cached.get("predicted_amount"),
-        "predicted_rate": cached.get("predicted_rate"),
-        "estimated_win_probability": cached.get("estimated_win_probability") or 0.0,
-    }
-    _render_notice_detail(db_path, detail_row)
+    with detail_slot:
+        if not selected_indices:
+            st.info("위 표에서 공고 행을 클릭하면 상세와 자동 모의입찰 내역이 여기 펼쳐집니다.")
+            return
+        selected_row = df.iloc[int(selected_indices[0])].to_dict()
+        notice_id = str(selected_row["notice_id"])
+        with st.container(border=True):
+            st.markdown(
+                f"**{selected_row.get('opened_at') or '–'} · `{notice_id}` · "
+                f"{selected_row.get('agency_name') or '–'}**"
+            )
+            _render_notice_inline_detail(
+                db_path, notice_id, selected_row, target_win_probability
+            )
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -1196,6 +1386,20 @@ def _monitoring_overview_cached(db_path: str) -> dict:
 @st.cache_data(ttl=5, show_spinner=False)
 def _monitoring_alerts_cached(db_path: str) -> list:
     return get_monitoring_alerts(db_path)
+
+
+def _is_auto_bid_running(db_path: str) -> bool:
+    """True iff the latest auto_bid_pending run is actively running and fresh.
+    Used to gate the 5s auto-refresh so idle sessions stay still.
+    """
+    summary = _ops_summary_cached(db_path)
+    run = summary.get("latest_auto_bid_run") or {}
+    if str(run.get("status") or "") != "running":
+        return False
+    # Require recent heartbeat; a stale 'running' is treated as idle for
+    # auto-refresh purposes (the realtime panel still shows a 멈춤 의심 card).
+    snap = _run_status_snapshot(run)
+    return bool(snap.get("active"))
 
 
 def _render_operations_summary(db_path: str) -> None:
@@ -1235,7 +1439,13 @@ def _render_operations_summary(db_path: str) -> None:
     st.markdown(f"<div class='subpro-card-grid'>{''.join(top_cards)}</div>", unsafe_allow_html=True)
     st.markdown(f"<div class='subpro-card-grid'>{''.join(api_cards)}</div>", unsafe_allow_html=True)
     latest_run = summary.get("latest_auto_bid_run")
-    if latest_run:
+    # Show the "최근 자동 입찰 배치" band only when an auto-bid is actively
+    # running (status=='running' with a fresh heartbeat). Stale `running`
+    # still renders in the 운영 모니터링 패널 as a 멈춤 의심 card.
+    is_active = bool(
+        latest_run and _run_status_snapshot(latest_run).get("active")
+    )
+    if latest_run and is_active:
         processed = int(latest_run.get("processed_items") or 0)
         total = int(latest_run.get("total_items") or 0)
         success = int(latest_run.get("success_items") or 0)
@@ -1973,12 +2183,13 @@ def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
             progress = st.progress(0.0, text=f"0/{len(notices)} 처리 중...")
             for i, notice in enumerate(notices):
                 try:
-                    cases, parent_used = _load_cases_adaptive(
+                    cases, meta = _load_cases_adaptive(
                         db_path, notice.notice_id, notice.agency_name,
                         notice.category, notice.contract_method, notice.opened_at,
                     )
-                    analyzer = AgencyRangeAnalyzer(cases, target_win_probability=target_win_probability)
+                    analyzer = _build_analyzer(cases, meta, target_win_probability)
                     prediction = NoticePredictor(analyzer).predict(notice)
+                    _annotate_shrinkage_note(prediction.analysis.notes, meta)
                     analysis = prediction.analysis
                     winners = top_winners_for_scope(
                         db_path, notice.agency_name, notice.category, notice.contract_method,
@@ -2006,7 +2217,8 @@ def _render_mock_tab(db_path: str, target_win_probability: float) -> None:
                     reports.append({
                         "notice": notice,
                         "report": report,
-                        "parent_used": parent_used,
+                        "parent_used": meta.get("parent_name"),
+                        "shrinkage": meta,
                         "confidence": analysis.confidence,
                     })
                     if persist:
@@ -2689,8 +2901,14 @@ def main() -> None:
     db_label = "로컬 수동 DB" if str(Path(db_path)) == "data/bids.db" else "운영 runner DB"
     st.caption(f"현재 연결 DB: `{db_path}` · {db_label}")
 
-    _render_operations_summary_fragment(db_path)
-    _render_monitoring_panel(db_path)
+    # Only auto-refresh the summary/monitoring panels when ingestion is
+    # actively running — idle sessions render once and stay still.
+    if _is_auto_bid_running(db_path):
+        _render_operations_summary_fragment(db_path)
+        _render_monitoring_panel(db_path)
+    else:
+        _render_operations_summary(db_path)
+        _render_realtime_status_content(db_path)
 
     view = st.segmented_control(
         "화면",

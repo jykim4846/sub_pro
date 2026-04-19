@@ -17,8 +17,14 @@ from g2b_bid_reco.db import (
     insert_case,
     list_pending_notice_prediction_rows,
     list_mock_bids,
+    get_agency_parent_pool,
+    load_cases_with_shrinkage,
+    refresh_mock_bid_evaluations,
     replace_auto_mock_bid_batch,
+    seed_agency_parent_mapping,
     start_automation_run,
+    upsert_bid_result,
+    upsert_demand_agency,
     upsert_notice_prediction_cache,
     update_automation_run,
 )
@@ -175,6 +181,98 @@ class SimulationStrategyTest(unittest.TestCase):
         self.assertEqual(agency["top_agency_name"], "최상위기관")
         self.assertEqual(agency["postal_code"], "30112")
 
+    def test_seed_agency_parent_mapping_prefers_user_api_top_agency(self) -> None:
+        with connect(self.db_path) as conn:
+            for idx, agency_name in enumerate(("강릉산학협력단", "삼척산학협력단"), start=1):
+                agency_code = f"C-00{idx}"
+                upsert_demand_agency(
+                    conn,
+                    agency_code=agency_code,
+                    agency_name=agency_name,
+                    top_agency_code="1000000",
+                    top_agency_name="강원대학교",
+                    source="user-api",
+                )
+                for notice_idx in range(30):
+                    notice_id = f"API-{idx}-{notice_idx}"
+                    conn.execute(
+                        """
+                        INSERT INTO bid_notices (
+                            notice_id, agency_name, agency_code, category, contract_method,
+                            region, base_amount, estimated_amount, opened_at
+                        ) VALUES (?, ?, ?, 'service', '일반경쟁', 'seoul', 100000000, 100000000, ?)
+                        """,
+                        (notice_id, agency_name, agency_code, f"2025-01-{notice_idx + 1:02d}"),
+                    )
+                    upsert_bid_result(
+                        conn,
+                        notice_id=notice_id,
+                        award_amount=88_000_000.0,
+                        bid_rate=88.0,
+                        bidder_count=10,
+                        winning_company="낙찰사",
+                        result_status="awarded",
+                        category="service",
+                    )
+
+        result = seed_agency_parent_mapping(self.db_path, min_subunits=2, min_parent_cases=50)
+        self.assertEqual(result["skipped_unsafe"], 0)
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT agency_name, parent_name, status, source
+                FROM agency_parent_mapping
+                ORDER BY agency_name
+                """
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["parent_name"], "강원대학교")
+        self.assertEqual(rows[1]["parent_name"], "강원대학교")
+        self.assertTrue(all(row["source"] == "auto" for row in rows))
+
+    def test_seed_agency_parent_mapping_falls_back_to_name_token(self) -> None:
+        with connect(self.db_path) as conn:
+            for idx, agency_name in enumerate(
+                ("서울특별시 강남구", "서울특별시 서초구"),
+                start=1,
+            ):
+                agency_code = f"1{idx:06d}"
+                for notice_idx in range(30):
+                    notice_id = f"TOKEN-{idx}-{notice_idx}"
+                    conn.execute(
+                        """
+                        INSERT INTO bid_notices (
+                            notice_id, agency_name, agency_code, category, contract_method,
+                            region, base_amount, estimated_amount, opened_at
+                        ) VALUES (?, ?, ?, 'service', '일반경쟁', 'seoul', 100000000, 100000000, ?)
+                        """,
+                        (notice_id, agency_name, agency_code, f"2025-02-{notice_idx + 1:02d}"),
+                    )
+                    upsert_bid_result(
+                        conn,
+                        notice_id=notice_id,
+                        award_amount=89_000_000.0,
+                        bid_rate=89.0,
+                        bidder_count=12,
+                        winning_company="낙찰사",
+                        result_status="awarded",
+                        category="service",
+                    )
+
+        result = seed_agency_parent_mapping(self.db_path, min_subunits=2, min_parent_cases=50)
+        self.assertEqual(result["skipped_unsafe"], 0)
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT agency_name, parent_name
+                FROM agency_parent_mapping
+                ORDER BY agency_name
+                """
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["parent_name"], "서울특별시")
+        self.assertEqual(rows[1]["parent_name"], "서울특별시")
+
     def test_automation_run_progress_tracking(self) -> None:
         start_automation_run(
             self.db_path,
@@ -306,6 +404,108 @@ class SimulationStrategyTest(unittest.TestCase):
             limit=10,
         )
         self.assertEqual(rows[0]["cache_status"], "stale")
+
+    def test_refresh_mock_bid_evaluations_materializes_verdicts(self) -> None:
+        with connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO bid_notices (
+                    notice_id, agency_name, category, contract_method, region,
+                    base_amount, estimated_amount, floor_rate, opened_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("EVAL-1", "기관A", "service", "적격심사", "seoul", 100_000_000.0, 100_000_000.0, 87.5, "2025-01-02"),
+            )
+            conn.execute(
+                """
+                INSERT INTO mock_bids (
+                    notice_id, bid_amount, bid_rate, predicted_amount,
+                    predicted_rate, note, simulation_id, customer_idx
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("EVAL-1", 87_600_000.0, 87.6, 87_700_000.0, 87.7, "auto:test", "auto-eval", 1),
+            )
+            upsert_bid_result(
+                conn,
+                notice_id="EVAL-1",
+                award_amount=88_000_000.0,
+                bid_rate=88.0,
+                bidder_count=10,
+                winning_company="낙찰사",
+                result_status="awarded",
+                category="service",
+            )
+
+        payload = refresh_mock_bid_evaluations(self.db_path)
+        self.assertEqual(payload["evaluated_mock_bids"], 1)
+        self.assertEqual(payload["won"], 1)
+        with connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT notice_id, verdict, actual_amount, actual_rate, simulation_id
+                FROM mock_bid_evaluations
+                WHERE notice_id = 'EVAL-1'
+                """
+            ).fetchone()
+        assert row is not None
+        self.assertEqual(row["verdict"], "won")
+        self.assertEqual(row["simulation_id"], "auto-eval")
+        self.assertAlmostEqual(row["actual_amount"], 88_000_000.0)
+
+    def test_refresh_mock_bid_evaluations_today_results_only(self) -> None:
+        with connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO bid_notices (
+                    notice_id, agency_name, category, contract_method, region,
+                    base_amount, estimated_amount, floor_rate, opened_at
+                ) VALUES
+                ('TODAY-1', '기관A', 'service', '적격심사', 'seoul', 100000000, 100000000, 87.5, '2025-01-02'),
+                ('OLD-1', '기관B', 'service', '적격심사', 'seoul', 100000000, 100000000, 87.5, '2025-01-03')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO mock_bids (
+                    notice_id, bid_amount, bid_rate, note, simulation_id, customer_idx
+                ) VALUES
+                ('TODAY-1', 87000000, 87.0, 'auto:test', 'auto-today', 1),
+                ('OLD-1', 87000000, 87.0, 'auto:test', 'auto-old', 1)
+                """
+            )
+            upsert_bid_result(
+                conn,
+                notice_id="TODAY-1",
+                award_amount=88_000_000.0,
+                bid_rate=88.0,
+                bidder_count=10,
+                winning_company="낙찰사",
+                result_status="awarded",
+                category="service",
+            )
+            upsert_bid_result(
+                conn,
+                notice_id="OLD-1",
+                award_amount=88_000_000.0,
+                bid_rate=88.0,
+                bidder_count=10,
+                winning_company="낙찰사",
+                result_status="awarded",
+                category="service",
+            )
+            conn.execute(
+                "UPDATE bid_results SET created_at = date('now', '-2 days') WHERE notice_id = 'OLD-1'"
+            )
+
+        payload = refresh_mock_bid_evaluations(self.db_path, today_results_only=True)
+        self.assertEqual(payload["evaluated_mock_bids"], 1)
+        with connect(self.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM mock_bid_evaluations").fetchone()[0]
+            notice_ids = {
+                row[0] for row in conn.execute("SELECT notice_id FROM mock_bid_evaluations").fetchall()
+            }
+        self.assertEqual(count, 1)
+        self.assertEqual(notice_ids, {"TODAY-1"})
 
     def test_resolve_demand_agency_endpoint_uses_first_non_404_candidate(self) -> None:
         calls: list[str] = []
@@ -520,6 +720,176 @@ class SimulationStrategyTest(unittest.TestCase):
         assert row is not None
         self.assertEqual(row["processed_items"], 2)
         self.assertEqual(row["success_items"], 2)
+
+
+    def _insert_awarded_case(
+        self,
+        conn,
+        *,
+        notice_id: str,
+        agency_name: str,
+        opened_at: str,
+        bid_rate: float = 88.0,
+        category: str = "service",
+        contract_method: str = "일반경쟁",
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO bid_notices (
+                notice_id, agency_name, agency_code, category, contract_method,
+                region, base_amount, estimated_amount, opened_at
+            ) VALUES (?, ?, '', ?, ?, 'seoul', 100000000, 100000000, ?)
+            """,
+            (notice_id, agency_name, category, contract_method, opened_at),
+        )
+        upsert_bid_result(
+            conn,
+            notice_id=notice_id,
+            award_amount=100_000_000.0 * (bid_rate / 100.0),
+            bid_rate=bid_rate,
+            bidder_count=10,
+            winning_company="winner",
+            result_status="awarded",
+            category=category,
+        )
+
+    def _map_parent(self, conn, agency_name: str, parent_name: str) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO agency_parent_mapping "
+            "(agency_name, parent_name, status, source) VALUES (?, ?, 'approved', 'auto')",
+            (agency_name, parent_name),
+        )
+
+    def test_shrinkage_no_parent_returns_own_only(self) -> None:
+        with connect(self.db_path) as conn:
+            for i in range(3):
+                self._insert_awarded_case(
+                    conn,
+                    notice_id=f"SOLO-{i}",
+                    agency_name="혼자기관",
+                    opened_at=f"2025-05-{i + 1:02d}",
+                    bid_rate=90.0,
+                )
+        cases, meta = load_cases_with_shrinkage(
+            self.db_path, "혼자기관",
+            category="service", contract_method="일반경쟁",
+        )
+        self.assertEqual(len(cases), 3)
+        self.assertEqual(meta["n_sub"], 3)
+        self.assertEqual(meta["n_parent_anchor"], 0)
+        self.assertIsNone(meta["parent_name"])
+        self.assertAlmostEqual(meta["w_sub"], 1.0)
+
+    def test_shrinkage_blends_sub_with_parent_pool(self) -> None:
+        with connect(self.db_path) as conn:
+            for i in range(5):
+                self._insert_awarded_case(
+                    conn,
+                    notice_id=f"SUB-{i}",
+                    agency_name="하위기관",
+                    opened_at=f"2025-06-{i + 1:02d}",
+                    bid_rate=85.0,
+                )
+            for i in range(20):
+                self._insert_awarded_case(
+                    conn,
+                    notice_id=f"SIB-{i}",
+                    agency_name="형제기관",
+                    opened_at=f"2025-06-{i + 1:02d}",
+                    bid_rate=95.0,
+                )
+            self._map_parent(conn, "하위기관", "상위기관")
+            self._map_parent(conn, "형제기관", "상위기관")
+
+        cases, meta = load_cases_with_shrinkage(
+            self.db_path, "하위기관",
+            category="service", contract_method="일반경쟁",
+            k=10,
+        )
+        self.assertEqual(meta["n_sub"], 5)
+        self.assertEqual(meta["n_parent_anchor"], 10)
+        self.assertEqual(meta["n_parent_available"], 20)
+        self.assertEqual(meta["parent_name"], "상위기관")
+        self.assertAlmostEqual(meta["w_sub"], 5 / 15)
+        self.assertEqual(len(cases), 15)
+        mean_rate = sum(c.bid_rate for c in cases) / len(cases)
+        # Expected blend mean = (5*85 + 10*95) / 15
+        self.assertAlmostEqual(mean_rate, (5 * 85 + 10 * 95) / 15, places=6)
+
+    def test_shrinkage_pure_parent_when_sub_empty(self) -> None:
+        with connect(self.db_path) as conn:
+            for i in range(15):
+                self._insert_awarded_case(
+                    conn,
+                    notice_id=f"ONLY-PARENT-{i}",
+                    agency_name="형제만",
+                    opened_at=f"2025-07-{i + 1:02d}",
+                    bid_rate=88.0,
+                )
+            self._map_parent(conn, "신생기관", "상위기관")
+            self._map_parent(conn, "형제만", "상위기관")
+
+        cases, meta = load_cases_with_shrinkage(
+            self.db_path, "신생기관",
+            category="service", contract_method="일반경쟁",
+            k=10,
+        )
+        self.assertEqual(meta["n_sub"], 0)
+        self.assertEqual(meta["n_parent_anchor"], 10)
+        self.assertEqual(meta["parent_name"], "상위기관")
+        self.assertAlmostEqual(meta["w_sub"], 0.0)
+        self.assertEqual(len(cases), 10)
+
+    def test_parent_pool_lookup_returns_siblings_and_parent(self) -> None:
+        with connect(self.db_path) as conn:
+            self._map_parent(conn, "하위기관A", "상위")
+            self._map_parent(conn, "하위기관B", "상위")
+            self._map_parent(conn, "하위기관C", "상위")
+            # Unrelated agency under a different parent.
+            self._map_parent(conn, "외부기관", "다른상위")
+        parent, pool = get_agency_parent_pool(self.db_path, "하위기관A")
+        self.assertEqual(parent, "상위")
+        self.assertIn("하위기관B", pool)
+        self.assertIn("하위기관C", pool)
+        self.assertIn("상위", pool)
+        self.assertNotIn("하위기관A", pool)
+        self.assertNotIn("외부기관", pool)
+
+    def test_parent_pool_lookup_empty_when_unmapped(self) -> None:
+        parent, pool = get_agency_parent_pool(self.db_path, "미매핑기관")
+        self.assertIsNone(parent)
+        self.assertEqual(pool, frozenset())
+
+    def test_shrinkage_large_sub_dominates(self) -> None:
+        with connect(self.db_path) as conn:
+            for i in range(40):
+                self._insert_awarded_case(
+                    conn,
+                    notice_id=f"BIG-SUB-{i}",
+                    agency_name="독립기관",
+                    opened_at=f"2025-08-{(i % 28) + 1:02d}",
+                    bid_rate=82.0,
+                )
+            for i in range(12):
+                self._insert_awarded_case(
+                    conn,
+                    notice_id=f"BIG-SIB-{i}",
+                    agency_name="형제2",
+                    opened_at=f"2025-08-{(i % 28) + 1:02d}",
+                    bid_rate=92.0,
+                )
+            self._map_parent(conn, "독립기관", "상위2")
+            self._map_parent(conn, "형제2", "상위2")
+
+        cases, meta = load_cases_with_shrinkage(
+            self.db_path, "독립기관",
+            category="service", contract_method="일반경쟁",
+            k=10,
+        )
+        self.assertEqual(meta["n_sub"], 40)
+        self.assertEqual(meta["n_parent_anchor"], 10)
+        self.assertAlmostEqual(meta["w_sub"], 40 / 50)
+        self.assertEqual(len(cases), 50)
 
 
 if __name__ == "__main__":

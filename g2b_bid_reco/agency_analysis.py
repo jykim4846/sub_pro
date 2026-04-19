@@ -17,6 +17,8 @@ class AgencyRangeAnalyzer:
         outlier_trim_quantile: float = 0.05,
         same_agency_weight_bonus: float = 2.0,
         target_win_probability: float = 0.75,
+        parent_pool_agencies: frozenset[str] | set[str] | None = None,
+        parent_name: str | None = None,
     ) -> None:
         self.cases = cases
         self.prior_strength = prior_strength
@@ -26,6 +28,10 @@ class AgencyRangeAnalyzer:
         self.outlier_trim_quantile = outlier_trim_quantile
         self.same_agency_weight_bonus = same_agency_weight_bonus
         self.target_win_probability = max(0.05, min(0.99, target_win_probability))
+        self.parent_pool_agencies = (
+            frozenset(parent_pool_agencies) if parent_pool_agencies else None
+        )
+        self.parent_name = parent_name
 
     def analyze(self, request: AgencyRangeRequest) -> AgencyRangeReport:
         peer_cases, lookback_years_used = self._select_peer_cases(request)
@@ -117,6 +123,10 @@ class AgencyRangeAnalyzer:
             and lo_ratio > 0
             and hi_ratio > lo_ratio
         )
+        # When a parent pool is supplied, narrow "peer" from scope-wide to
+        # just the sibling group so shrinkage points toward the parent-agency
+        # trend instead of the category-wide mean.
+        pool_filter = self.parent_pool_agencies
         peers: list[HistoricalBidCase] = []
         for case in self.cases:
             if case.category != request.category:
@@ -124,6 +134,12 @@ class AgencyRangeAnalyzer:
             if case.contract_method != request.contract_method:
                 continue
             if request.region and case.region != request.region:
+                continue
+            if (
+                pool_filter is not None
+                and case.agency_name != request.agency_name
+                and case.agency_name not in pool_filter
+            ):
                 continue
             if has_ratio_filter and case.base_amount > 0:
                 ratio = case.base_amount / request.base_amount
