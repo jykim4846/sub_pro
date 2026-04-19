@@ -1,8 +1,11 @@
 .env
 .env.local
 data/*.db
+data/bids.db-*
 data/*.bak
 data/*.csv
+data/*.sqlitebackup
+data/*.pre-merge.*
 __pycache__/
 .pytest_cache/
 .omx/
