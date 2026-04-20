@@ -327,8 +327,12 @@ def init_db(db_path: str | Path) -> None:
         )
         _ensure_column(conn, "mock_bids", "simulation_id", "TEXT DEFAULT ''")
         _ensure_column(conn, "mock_bids", "customer_idx", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "mock_bids", "n_customers", "INTEGER DEFAULT 0")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mock_bids_simulation ON mock_bids(simulation_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mock_bids_sim_n ON mock_bids(simulation_id, n_customers)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_automation_daily_stats_updated_at ON automation_daily_stats(updated_at)"
@@ -354,6 +358,49 @@ def init_db(db_path: str | Path) -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mock_bid_evaluations_verdict ON mock_bid_evaluations(verdict, evaluated_at DESC)"
+        )
+        _ensure_column(conn, "mock_bid_evaluations", "n_customers", "INTEGER DEFAULT 0")
+        _backfill_n_customers(conn)
+
+
+def _backfill_n_customers(conn: sqlite3.Connection) -> None:
+    """Populate n_customers from max(customer_idx) per simulation_id.
+
+    Idempotent and bounded: only runs UPDATE if at least one candidate row
+    exists (probe via indexed lookup on simulation_id). Skips legacy rows
+    with empty simulation_id since their customer_idx is also 0.
+    """
+    probe = conn.execute(
+        "SELECT 1 FROM mock_bids "
+        "WHERE simulation_id != '' AND n_customers = 0 LIMIT 1"
+    ).fetchone()
+    if probe is not None:
+        conn.execute(
+            """
+            UPDATE mock_bids
+            SET n_customers = (
+                SELECT MAX(m2.customer_idx)
+                FROM mock_bids m2
+                WHERE m2.simulation_id = mock_bids.simulation_id
+            )
+            WHERE simulation_id != '' AND n_customers = 0
+            """
+        )
+    probe = conn.execute(
+        "SELECT 1 FROM mock_bid_evaluations "
+        "WHERE simulation_id != '' AND n_customers = 0 LIMIT 1"
+    ).fetchone()
+    if probe is not None:
+        conn.execute(
+            """
+            UPDATE mock_bid_evaluations
+            SET n_customers = (
+                SELECT MAX(e2.customer_idx)
+                FROM mock_bid_evaluations e2
+                WHERE e2.simulation_id = mock_bid_evaluations.simulation_id
+            )
+            WHERE simulation_id != '' AND n_customers = 0
+            """
         )
 
 
