@@ -62,3 +62,14 @@ for cat in "${CATEGORIES[@]}"; do
 done
 
 echo "Done. All requested categories processed."
+
+# Optionally push the enriched DB to Turso so PC2 can pull it.
+# Gated on TURSO_SYNC env var (default on) and turso CLI presence, same as
+# the daily batch. Soft-fail: enrich completion isn't blocked by sync issues.
+TURSO_SYNC="${TURSO_SYNC:-1}"
+if [ "${TURSO_SYNC}" = "1" ] && command -v turso >/dev/null 2>&1; then
+    echo "=========================================="
+    echo " uploading enriched DB to Turso"
+    echo "=========================================="
+    bash "$(dirname "$0")/turso-push.sh" || echo "[warn] turso-push failed"
+fi
