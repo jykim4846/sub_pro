@@ -238,6 +238,16 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--today-results-only", action="store_true")
     eval_parser.add_argument("--simulation-id")
 
+    strategy_parser = subparsers.add_parser(
+        "build-strategy-tables",
+        help="Populate strategy_tables via monte carlo over historical bid_results (MODES.md Path B).",
+    )
+    strategy_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    strategy_parser.add_argument("--n-max", type=int, default=10)
+    strategy_parser.add_argument("--n-trials", type=int, default=2000)
+    strategy_parser.add_argument("--min-samples", type=int, default=30)
+    strategy_parser.add_argument("--seed", type=int, default=42)
+
     return parser
 
 
@@ -506,6 +516,19 @@ def main() -> int:
             simulation_id=(args.simulation_id or "").strip() or None,
         )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "build-strategy-tables":
+        from .strategy_mc import build_strategy_tables
+        init_db(args.db_path)
+        summary = build_strategy_tables(
+            args.db_path,
+            n_range=range(1, args.n_max + 1),
+            n_trials=args.n_trials,
+            min_samples=args.min_samples,
+            seed=args.seed,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
     parser.error("Unknown command")
