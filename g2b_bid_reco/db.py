@@ -211,6 +211,20 @@ CREATE TABLE IF NOT EXISTS mock_bid_evaluations (
     result_created_at TEXT,
     evaluated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS strategy_tables (
+    agency_name TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT '',
+    contract_method TEXT NOT NULL DEFAULT '',
+    region TEXT NOT NULL DEFAULT '',
+    n_customers INTEGER NOT NULL,
+    quantiles_json TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'montecarlo',
+    sample_size INTEGER NOT NULL DEFAULT 0,
+    win_rate_estimate REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (agency_name, category, contract_method, region, n_customers)
+);
 """
 
 
@@ -361,6 +375,10 @@ def init_db(db_path: str | Path) -> None:
         )
         _ensure_column(conn, "mock_bid_evaluations", "n_customers", "INTEGER DEFAULT 0")
         _backfill_n_customers(conn)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_strategy_tables_scope "
+            "ON strategy_tables(category, contract_method, n_customers)"
+        )
 
 
 def _backfill_n_customers(conn: sqlite3.Connection) -> None:

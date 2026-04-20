@@ -66,6 +66,33 @@ def test_fresh_db_has_n_customers_columns(tmp_path: Path) -> None:
         assert _column_exists(conn, "mock_bid_evaluations", "n_customers")
 
 
+def test_fresh_db_has_strategy_tables(tmp_path: Path) -> None:
+    db = tmp_path / "fresh.db"
+    init_db(db)
+    with connect(db) as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "strategy_tables" in tables
+        # Probe write + read to catch schema typos
+        conn.execute(
+            "INSERT INTO strategy_tables "
+            "(agency_name, category, contract_method, region, n_customers, "
+            " quantiles_json, source, sample_size, win_rate_estimate) "
+            "VALUES ('대한민국정부', 'goods', '전자입찰', '서울', 3, "
+            "'[0.25, 0.5, 0.75]', 'montecarlo', 250, 0.62)"
+        )
+        row = conn.execute(
+            "SELECT quantiles_json, win_rate_estimate "
+            "FROM strategy_tables WHERE n_customers = 3"
+        ).fetchone()
+        assert row["quantiles_json"] == "[0.25, 0.5, 0.75]"
+        assert row["win_rate_estimate"] == 0.62
+
+
 def test_init_db_adds_n_customers_to_legacy_schema(tmp_path: Path) -> None:
     db = tmp_path / "legacy.db"
     init_db(db)  # create base schema
