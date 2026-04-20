@@ -261,6 +261,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="v2 only: cap on competitor count per trial",
     )
 
+    cleanup_parser = subparsers.add_parser(
+        "cleanup-floor-rates",
+        help="Fill NULL/0/outlier floor_rate with the (category, contract_method) modal value.",
+    )
+    cleanup_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    cleanup_parser.add_argument(
+        "--contract-methods", nargs="+", default=["전자입찰"],
+        help="Target contract methods. Default: 전자입찰 only (낙찰하한제 적용 scope).",
+    )
+    cleanup_parser.add_argument(
+        "--min-modal-n", type=int, default=30,
+        help="Minimum sample size required to trust the scope's modal value.",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Compute target counts but do not write back.",
+    )
+
     update_strategy_parser = subparsers.add_parser(
         "update-strategy-tables",
         help="Blend observed win-rates into strategy_tables via EMA (MODES.md Path C).",
@@ -579,6 +597,18 @@ def main() -> int:
             args.db_path,
             alpha=float(args.alpha),
             min_decided=int(args.min_decided),
+            dry_run=bool(args.dry_run),
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "cleanup-floor-rates":
+        from .data_cleanup import cleanup_floor_rates
+        init_db(args.db_path)
+        summary = cleanup_floor_rates(
+            args.db_path,
+            contract_methods=args.contract_methods,
+            min_modal_n=int(args.min_modal_n),
             dry_run=bool(args.dry_run),
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))

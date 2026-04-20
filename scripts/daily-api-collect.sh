@@ -27,6 +27,8 @@
 #                         decided rows; recommended weekly, not daily)
 #   STRATEGY_CALIBRATE_ALPHA default: 0.1
 #   STRATEGY_CALIBRATE_MIN_DECIDED default: 20
+#   FLOOR_RATE_CLEANUP_ENABLED default: 1  (fill NULL/0/outlier floor_rate
+#                         on 전자입찰 scope with the scope modal; idempotent)
 #   SYNC_DEMAND_AGENCIES default: 1
 #   G2B_USER_INFO_ENDPOINT optional exact demand-agency operation URL
 #   DEMAND_AGENCY_SINCE optional YYYYMMDD or YYYYMMDDHHMM for agency sync window start
@@ -64,6 +66,7 @@ EVALUATE_MOCK_BIDS="${EVALUATE_MOCK_BIDS:-1}"
 STRATEGY_CALIBRATE_ENABLED="${STRATEGY_CALIBRATE_ENABLED:-0}"
 STRATEGY_CALIBRATE_ALPHA="${STRATEGY_CALIBRATE_ALPHA:-0.1}"
 STRATEGY_CALIBRATE_MIN_DECIDED="${STRATEGY_CALIBRATE_MIN_DECIDED:-20}"
+FLOOR_RATE_CLEANUP_ENABLED="${FLOOR_RATE_CLEANUP_ENABLED:-1}"
 SYNC_DEMAND_AGENCIES="${SYNC_DEMAND_AGENCIES:-1}"
 G2B_USER_INFO_ENDPOINT="${G2B_USER_INFO_ENDPOINT:-}"
 DEMAND_AGENCY_SINCE="${DEMAND_AGENCY_SINCE:-}"
@@ -111,6 +114,13 @@ TURSO_SYNC="${TURSO_SYNC:-1}"
             AGENCY_ARGS+=( --until "${DEMAND_AGENCY_UNTIL}" )
         fi
         "${PYTHON_BIN}" "${AGENCY_ARGS[@]}" || echo "[warn] sync-demand-agencies failed"
+    fi
+    if [ "${FLOOR_RATE_CLEANUP_ENABLED}" = "1" ]; then
+        echo "---"
+        echo "[floor-rate] filling NULL/0/outlier floor_rate on 전자입찰 scope"
+        "${PYTHON_BIN}" -m g2b_bid_reco.cli cleanup-floor-rates \
+            --db-path "${DB_PATH}" \
+            || echo "[warn] cleanup-floor-rates failed"
     fi
     if [ "${EVALUATE_MOCK_BIDS}" = "1" ]; then
         echo "---"
