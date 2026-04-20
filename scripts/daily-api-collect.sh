@@ -65,9 +65,19 @@ mkdir -p "${LOG_DIR}"
 TS="$(date +%Y%m%dT%H%M%S)"
 LOG_FILE="${LOG_DIR}/daily-api-collect-${TS}.log"
 
+# Turso sync is optional: only runs if turso CLI is installed and TURSO_SYNC
+# is not explicitly disabled. Failures are soft — a missing/broken sync
+# must not prevent the daily batch from running.
+TURSO_SYNC="${TURSO_SYNC:-1}"
+
 {
     echo "[start] $(date -Iseconds)"
     echo "db=${DB_PATH}  categories='${CATEGORIES}'  sources=${SOURCES}  fallback_days=${FALLBACK_DAYS}"
+    if [ "${TURSO_SYNC}" = "1" ] && command -v turso >/dev/null 2>&1; then
+        echo "---"
+        echo "[turso-pull] fetching latest cloud snapshot before batch"
+        bash scripts/turso-pull.sh || echo "[warn] turso-pull failed — continuing with local DB"
+    fi
     for CAT in ${CATEGORIES}; do
         echo "---"
         echo "[collect] category=${CAT}"
@@ -131,5 +141,10 @@ db_path = os.environ["G2B_DAILY_DB_PATH"]
 sid = take_weekly_snapshot(db_path, fee_rate=0.0005)
 print(f"snapshot_id={sid}, auto_suggestions={auto_generate_suggestions(db_path)}")
 PY
+    if [ "${TURSO_SYNC}" = "1" ] && command -v turso >/dev/null 2>&1; then
+        echo "---"
+        echo "[turso-push] uploading updated DB to cloud"
+        bash scripts/turso-push.sh || echo "[warn] turso-push failed — local DB intact"
+    fi
     echo "[done] $(date -Iseconds)"
 } | tee -a "${LOG_FILE}"
