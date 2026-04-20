@@ -261,6 +261,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="v2 only: cap on competitor count per trial",
     )
 
+    update_strategy_parser = subparsers.add_parser(
+        "update-strategy-tables",
+        help="Blend observed win-rates into strategy_tables via EMA (MODES.md Path C).",
+    )
+    update_strategy_parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    update_strategy_parser.add_argument(
+        "--alpha", type=float, default=0.1,
+        help="EMA weight on observed rate (default 0.1 — conservative).",
+    )
+    update_strategy_parser.add_argument(
+        "--min-decided", type=int, default=20,
+        help="Minimum decided evaluations required to update a (scope, N) row.",
+    )
+    update_strategy_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Compute diffs but do not write back to strategy_tables.",
+    )
+
     return parser
 
 
@@ -551,6 +569,18 @@ def main() -> int:
                 max_bidders=args.max_bidders,
                 seed=args.seed,
             )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "update-strategy-tables":
+        from .strategy_update import ema_update_strategy_tables
+        init_db(args.db_path)
+        summary = ema_update_strategy_tables(
+            args.db_path,
+            alpha=float(args.alpha),
+            min_decided=int(args.min_decided),
+            dry_run=bool(args.dry_run),
+        )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 

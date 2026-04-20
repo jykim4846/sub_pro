@@ -22,6 +22,11 @@
 #                         to recent pending notices after the initial full load)
 #   AUTO_BID_TARGET_WIN default: 0.75
 #   EVALUATE_MOCK_BIDS default: 1
+#   STRATEGY_CALIBRATE_ENABLED default: 0  (opt-in Path C EMA — turn on
+#                         once mock_bid_evaluations has accrued enough
+#                         decided rows; recommended weekly, not daily)
+#   STRATEGY_CALIBRATE_ALPHA default: 0.1
+#   STRATEGY_CALIBRATE_MIN_DECIDED default: 20
 #   SYNC_DEMAND_AGENCIES default: 1
 #   G2B_USER_INFO_ENDPOINT optional exact demand-agency operation URL
 #   DEMAND_AGENCY_SINCE optional YYYYMMDD or YYYYMMDDHHMM for agency sync window start
@@ -56,6 +61,9 @@ AUTO_BID_LIMIT="${AUTO_BID_LIMIT:-500}"
 AUTO_BID_SINCE_DAYS="${AUTO_BID_SINCE_DAYS:-14}"
 AUTO_BID_TARGET_WIN="${AUTO_BID_TARGET_WIN:-0.75}"
 EVALUATE_MOCK_BIDS="${EVALUATE_MOCK_BIDS:-1}"
+STRATEGY_CALIBRATE_ENABLED="${STRATEGY_CALIBRATE_ENABLED:-0}"
+STRATEGY_CALIBRATE_ALPHA="${STRATEGY_CALIBRATE_ALPHA:-0.1}"
+STRATEGY_CALIBRATE_MIN_DECIDED="${STRATEGY_CALIBRATE_MIN_DECIDED:-20}"
 SYNC_DEMAND_AGENCIES="${SYNC_DEMAND_AGENCIES:-1}"
 G2B_USER_INFO_ENDPOINT="${G2B_USER_INFO_ENDPOINT:-}"
 DEMAND_AGENCY_SINCE="${DEMAND_AGENCY_SINCE:-}"
@@ -111,6 +119,15 @@ TURSO_SYNC="${TURSO_SYNC:-1}"
             --db-path "${DB_PATH}" \
             --today-results-only \
             || echo "[warn] evaluate-mock-bids failed"
+    fi
+    if [ "${STRATEGY_CALIBRATE_ENABLED}" = "1" ]; then
+        echo "---"
+        echo "[strategy-calibrate] EMA calibration on strategy_tables (Path C)"
+        "${PYTHON_BIN}" -m g2b_bid_reco.cli update-strategy-tables \
+            --db-path "${DB_PATH}" \
+            --alpha "${STRATEGY_CALIBRATE_ALPHA}" \
+            --min-decided "${STRATEGY_CALIBRATE_MIN_DECIDED}" \
+            || echo "[warn] update-strategy-tables failed"
     fi
     if [ "${AUTO_BID_ENABLED}" = "1" ]; then
         echo "---"
