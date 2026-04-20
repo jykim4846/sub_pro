@@ -247,6 +247,18 @@ def build_parser() -> argparse.ArgumentParser:
     strategy_parser.add_argument("--n-trials", type=int, default=2000)
     strategy_parser.add_argument("--min-samples", type=int, default=30)
     strategy_parser.add_argument("--seed", type=int, default=42)
+    strategy_parser.add_argument(
+        "--model",
+        choices=["v1", "v2"],
+        default="v2",
+        help="v1=coverage (historical), v2=within-notice 평균가 auction (default, MODES.md §9)",
+    )
+    strategy_parser.add_argument(
+        "--max-bidders",
+        type=int,
+        default=50,
+        help="v2 only: cap on competitor count per trial",
+    )
 
     return parser
 
@@ -519,15 +531,25 @@ def main() -> int:
         return 0
 
     if args.command == "build-strategy-tables":
-        from .strategy_mc import build_strategy_tables
+        from .strategy_mc import build_strategy_tables, build_strategy_tables_v2
         init_db(args.db_path)
-        summary = build_strategy_tables(
-            args.db_path,
-            n_range=range(1, args.n_max + 1),
-            n_trials=args.n_trials,
-            min_samples=args.min_samples,
-            seed=args.seed,
-        )
+        if args.model == "v1":
+            summary = build_strategy_tables(
+                args.db_path,
+                n_range=range(1, args.n_max + 1),
+                n_trials=args.n_trials,
+                min_samples=args.min_samples,
+                seed=args.seed,
+            )
+        else:
+            summary = build_strategy_tables_v2(
+                args.db_path,
+                n_range=range(1, args.n_max + 1),
+                n_trials=args.n_trials,
+                min_samples=args.min_samples,
+                max_bidders=args.max_bidders,
+                seed=args.seed,
+            )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
