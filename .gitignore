@@ -6,9 +6,14 @@ data/*.bak
 data/*.csv
 data/*.sqlitebackup
 data/*.pre-merge.*
+data/backups/
 __pycache__/
 .pytest_cache/
 .omx/
 .omc/
+.claude/
 .DS_Store
 reports/
+
+# .env backup files
+.env.bak*
