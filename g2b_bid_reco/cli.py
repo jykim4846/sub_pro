@@ -220,6 +220,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync_agency_parser.add_argument("--inqry-div", default="1")
     sync_agency_parser.add_argument("--since")
     sync_agency_parser.add_argument("--until")
+    sync_agency_parser.add_argument(
+        "--since-days",
+        type=int,
+        default=7,
+        help="Default incremental window (days) when --since/--until are not provided. "
+             "The user-info API returns 0 items without a window and errors on ranges "
+             "wider than a few months, so a bounded default is required.",
+    )
     sync_agency_parser.add_argument("--print-candidates", action="store_true")
 
     eval_parser = subparsers.add_parser(
@@ -454,10 +462,11 @@ def main() -> int:
             "inqryDiv": args.inqry_div,
             "type": "json",
         }
-        if args.since:
-            query["inqryBgnDt"] = _parse_cli_datetime_text(args.since).strftime("%Y%m%d%H%M")
-        if args.until:
-            query["inqryEndDt"] = _parse_cli_datetime_text(args.until).strftime("%Y%m%d%H%M")
+        now_dt = datetime.now()
+        since_dt = _parse_cli_datetime_text(args.since) if args.since else now_dt - timedelta(days=max(1, args.since_days))
+        until_dt = _parse_cli_datetime_text(args.until) if args.until else now_dt
+        query["inqryBgnDt"] = since_dt.strftime("%Y%m%d%H%M")
+        query["inqryEndDt"] = until_dt.strftime("%Y%m%d%H%M")
         try:
             result = collector.sync_demand_agencies(
                 endpoint=endpoint,
