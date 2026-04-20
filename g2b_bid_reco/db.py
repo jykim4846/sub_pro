@@ -1736,6 +1736,64 @@ def load_strategy_table_for_scope(
     return out
 
 
+def list_strategy_table_rows(db_path: str | Path) -> list[dict]:
+    """Return every strategy_tables row with quantiles parsed to a float list.
+
+    Used by the dashboard's strategy view to render win-rate curves and
+    per-N quantile detail tables.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT agency_name, category, contract_method, region,
+                   n_customers, quantiles_json, source,
+                   sample_size, win_rate_estimate, updated_at
+            FROM strategy_tables
+            ORDER BY category, contract_method, agency_name, region, n_customers
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["quantiles"] = [float(q) for q in json.loads(d.pop("quantiles_json"))]
+        except (TypeError, ValueError):
+            d["quantiles"] = []
+        out.append(d)
+    return out
+
+
+def summarize_evaluations_by_scope_n(db_path: str | Path) -> list[dict]:
+    """Observed win_rate per (scope, n_customers) from mock_bid_evaluations.
+
+    Scope key mirrors strategy_tables' populated scopes (category +
+    contract_method). Returns empty list until evaluations accumulate for
+    auto:strategy_v2 portfolios.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT n.category, n.contract_method, e.n_customers,
+                   SUM(CASE WHEN e.verdict = 'won' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN e.verdict IN ('won', 'lost') THEN 1 ELSE 0 END) AS decided,
+                   COUNT(*) AS total
+            FROM mock_bid_evaluations e
+            JOIN bid_notices n ON n.notice_id = e.notice_id
+            WHERE e.n_customers > 0
+              AND n.category <> '' AND n.contract_method <> ''
+            GROUP BY n.category, n.contract_method, e.n_customers
+            HAVING decided > 0
+            ORDER BY n.category, n.contract_method, e.n_customers
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        d["observed_win_rate"] = float(d["wins"]) / float(d["decided"]) if d["decided"] else None
+        out.append(d)
+    return out
+
+
 def replace_auto_mock_bid_batch(
     db_path: str | Path,
     simulation_id: str,

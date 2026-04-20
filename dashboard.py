@@ -42,6 +42,7 @@ from g2b_bid_reco.db import (
     list_pending_notice_prediction_rows,
     list_run_tasks,
     list_simulation_ids,
+    list_strategy_table_rows,
     list_suggestions,
     load_backtestable_notices_for_agency,
     list_mock_bids_for_notice,
@@ -54,6 +55,7 @@ from g2b_bid_reco.db import (
     AGENCY_SHRINKAGE_K,
     replace_auto_mock_bid_batch,
     seed_agency_parent_mapping,
+    summarize_evaluations_by_scope_n,
     take_weekly_snapshot,
     top_winners_for_scope,
     upsert_notice_prediction_cache,
@@ -2862,6 +2864,139 @@ def _render_search_detail(db_path: str, row: dict, target_win_probability: float
     _render_table(df_back)
 
 
+@st.cache_data(ttl=300)
+def _strategy_rows_cached(db_path: str) -> list[dict]:
+    return list_strategy_table_rows(db_path)
+
+
+@st.cache_data(ttl=300)
+def _observed_win_rates_cached(db_path: str) -> list[dict]:
+    return summarize_evaluations_by_scope_n(db_path)
+
+
+def _render_strategy_tab(db_path: str) -> None:
+    st.subheader("📊 전략 테이블 (Path B 몬테카를로)")
+    st.caption(
+        "scope (카테고리 × 계약방식) × N 고객 수 별 최적 quantile 분포와 추정 "
+        "낙찰 확률입니다. auto-bid 워커가 이 테이블을 읽어 N=1..Nmax 포트폴리오를 "
+        "생성합니다. 자세한 설명은 MODES.md §3 참고."
+    )
+
+    rows = _strategy_rows_cached(db_path)
+    if not rows:
+        st.info(
+            "`strategy_tables` 가 비어 있습니다. CLI "
+            "`python3 -m g2b_bid_reco.cli build-strategy-tables --db-path "
+            "data/bids.db --model v2` 를 먼저 실행하세요."
+        )
+        return
+
+    df = pd.DataFrame(rows)
+    df["scope"] = df["category"].astype(str) + " / " + df["contract_method"].astype(str)
+    scopes = sorted(df["scope"].unique())
+
+    selected = st.multiselect(
+        "스코프 선택 (비워두면 전체)",
+        scopes,
+        default=scopes if len(scopes) <= 6 else scopes[:6],
+        key="strategy_scope_select",
+    )
+    view = df[df["scope"].isin(selected)] if selected else df
+
+    # N vs win_rate 라인 차트 (scope별)
+    fig = go.Figure()
+    for scope, g in view.sort_values("n_customers").groupby("scope"):
+        fig.add_trace(
+            go.Scatter(
+                x=g["n_customers"],
+                y=g["win_rate_estimate"],
+                mode="lines+markers",
+                name=scope,
+                hovertemplate="%{fullData.name}<br>N=%{x}<br>win_rate=%{y:.1%}<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        xaxis_title="N (고객 수)",
+        yaxis_title="추정 낙찰 확률",
+        yaxis_tickformat=".0%",
+        height=440,
+        margin=dict(t=20, b=40, l=40, r=20),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.28),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("#### N별 quantile 분포 상세")
+    focus = st.selectbox("상세 스코프", scopes, key="strategy_focus_scope")
+    detail = df[df["scope"] == focus].sort_values("n_customers")
+    if detail.empty:
+        st.info("해당 스코프에 rows 가 없습니다.")
+    else:
+        detail_view = detail.copy()
+        detail_view["quantiles"] = detail_view["quantiles"].apply(
+            lambda xs: ", ".join(f"{float(q):.2f}" for q in (xs or []))
+        )
+        detail_view["win_rate"] = detail_view["win_rate_estimate"].apply(
+            lambda v: f"{float(v):.1%}" if v is not None else "–"
+        )
+        detail_view = detail_view.rename(
+            columns={
+                "n_customers": "N",
+                "sample_size": "표본",
+                "source": "출처",
+                "updated_at": "갱신",
+            }
+        )
+        st.dataframe(
+            detail_view[["N", "quantiles", "win_rate", "표본", "출처", "갱신"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("---")
+    st.markdown("#### 실측 win_rate 비교 (mock_bid_evaluations)")
+    observed = _observed_win_rates_cached(db_path)
+    if not observed:
+        st.info(
+            "아직 `mock_bid_evaluations` 데이터가 없습니다. auto-bid 가 strategy_v2 "
+            "포트폴리오를 쌓고 낙찰 결과가 들어오면 여기서 추정치와 실측을 비교합니다."
+        )
+        return
+
+    obs_df = pd.DataFrame(observed)
+    obs_df["scope"] = obs_df["category"].astype(str) + " / " + obs_df["contract_method"].astype(str)
+    merged = df.merge(
+        obs_df[["scope", "n_customers", "observed_win_rate", "decided", "wins"]],
+        on=["scope", "n_customers"],
+        how="left",
+    )
+    merged = merged[merged["scope"].isin(selected)] if selected else merged
+    merged = merged.dropna(subset=["observed_win_rate"])
+    if merged.empty:
+        st.info("선택된 scope 에 실측 데이터가 아직 없습니다.")
+        return
+
+    merged["gap"] = merged["observed_win_rate"] - merged["win_rate_estimate"]
+    compare_view = merged[
+        ["scope", "n_customers", "win_rate_estimate", "observed_win_rate", "decided", "wins", "gap"]
+    ].rename(
+        columns={
+            "n_customers": "N",
+            "win_rate_estimate": "추정",
+            "observed_win_rate": "실측",
+            "decided": "판정표본",
+            "wins": "낙찰",
+            "gap": "격차 (실측-추정)",
+        }
+    )
+    for col in ("추정", "실측", "격차 (실측-추정)"):
+        compare_view[col] = compare_view[col].apply(
+            lambda v: f"{float(v):+.1%}" if col == "격차 (실측-추정)" and v is not None
+            else (f"{float(v):.1%}" if v is not None else "–")
+        )
+    st.dataframe(compare_view, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="G2B 입찰 예측 대시보드", layout="wide")
     _inject_dashboard_styles()
@@ -2916,6 +3051,7 @@ def main() -> None:
             "📝 진행 중 공고",
             "🔍 공고 검색",
             "🎯 모의 입찰",
+            "📊 전략 테이블",
             "🧩 기관 통합 관리",
             "📈 주간 리뷰",
         ],
@@ -2929,6 +3065,8 @@ def main() -> None:
         _render_search_tab(db_path, target_win_probability)
     elif view == "🎯 모의 입찰":
         _render_mock_tab(db_path, target_win_probability)
+    elif view == "📊 전략 테이블":
+        _render_strategy_tab(db_path)
     elif view == "🧩 기관 통합 관리":
         _render_mapping_tab(db_path)
     elif view == "📈 주간 리뷰":

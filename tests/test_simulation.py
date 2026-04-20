@@ -18,9 +18,11 @@ from g2b_bid_reco.db import (
     list_pending_notice_prediction_rows,
     list_mock_bids,
     get_agency_parent_pool,
+    list_strategy_table_rows,
     load_cases_with_shrinkage,
     load_strategy_table_for_scope,
     refresh_mock_bid_evaluations,
+    summarize_evaluations_by_scope_n,
     replace_auto_mock_bid_batch,
     seed_agency_parent_mapping,
     start_automation_run,
@@ -1029,6 +1031,68 @@ class SimulationStrategyTest(unittest.TestCase):
         self.assertTrue(all(str(r["note"]).startswith("auto:strategy_v2") for r in rows))
         ns = sorted(int(r["n_customers"]) for r in rows)
         self.assertEqual(ns, [1, 2, 2, 3, 3, 3])
+
+    def test_list_strategy_table_rows_parses_quantiles(self) -> None:
+        with connect(self.db_path) as conn:
+            for n, qs in [(1, [0.5]), (3, [0.2, 0.5, 0.8])]:
+                conn.execute(
+                    """
+                    INSERT INTO strategy_tables
+                        (agency_name, category, contract_method, region,
+                         n_customers, quantiles_json, source,
+                         sample_size, win_rate_estimate)
+                    VALUES ('', 'goods', '전자입찰', '', ?, ?, 'montecarlo_v2', 42, 0.6)
+                    """,
+                    (n, json.dumps(qs)),
+                )
+        rows = list_strategy_table_rows(self.db_path)
+        self.assertEqual(len(rows), 2)
+        rows_by_n = {r["n_customers"]: r for r in rows}
+        self.assertEqual(rows_by_n[1]["quantiles"], [0.5])
+        self.assertEqual(rows_by_n[3]["quantiles"], [0.2, 0.5, 0.8])
+        self.assertEqual(rows_by_n[3]["source"], "montecarlo_v2")
+        self.assertNotIn("quantiles_json", rows_by_n[1])
+
+    def test_summarize_evaluations_by_scope_n_computes_win_rate(self) -> None:
+        # Seed a notice so JOIN resolves, plus 5 mock_bids with verdicts.
+        with connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO bid_notices (notice_id, agency_name, category,
+                    contract_method, region, base_amount, opened_at)
+                VALUES ('EVAL-N-1', '기관X', 'service', '전자입찰', 'seoul',
+                        100000000, '2025-03-01')
+                """
+            )
+            for i in range(5):
+                conn.execute(
+                    """
+                    INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
+                        note, simulation_id, customer_idx, n_customers)
+                    VALUES ('EVAL-N-1', ?, ?, 'auto:strategy_v2', 'sim-1', ?, 5)
+                    """,
+                    (90_000_000 + i, 90.0 + i * 0.1, i + 1),
+                )
+            # 3 won, 2 lost for (service/전자입찰, N=5)
+            for mock_id, verdict in ((1, "won"), (2, "won"), (3, "won"), (4, "lost"), (5, "lost")):
+                conn.execute(
+                    """
+                    INSERT INTO mock_bid_evaluations (mock_id, notice_id,
+                        simulation_id, customer_idx, bid_amount, bid_rate,
+                        verdict, n_customers)
+                    VALUES (?, 'EVAL-N-1', 'sim-1', ?, 0, 0, ?, 5)
+                    """,
+                    (mock_id, mock_id, verdict),
+                )
+        out = summarize_evaluations_by_scope_n(self.db_path)
+        self.assertEqual(len(out), 1)
+        row = out[0]
+        self.assertEqual(row["category"], "service")
+        self.assertEqual(row["contract_method"], "전자입찰")
+        self.assertEqual(row["n_customers"], 5)
+        self.assertEqual(row["wins"], 3)
+        self.assertEqual(row["decided"], 5)
+        self.assertAlmostEqual(row["observed_win_rate"], 0.6)
 
 
 if __name__ == "__main__":
