@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -1678,7 +1679,7 @@ def save_mock_bid_batch(
 ) -> int:
     """Insert many mock bids in one transaction. Each row must have keys:
     notice_id, bid_amount, bid_rate, predicted_amount, predicted_rate,
-    note, customer_idx."""
+    note, customer_idx. Optional: n_customers."""
     if not rows:
         return 0
     with connect(db_path) as conn:
@@ -1686,17 +1687,53 @@ def save_mock_bid_batch(
             """
             INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
                 predicted_amount, predicted_rate, note, simulation_id,
-                customer_idx, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                customer_idx, n_customers, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             [
                 (r["notice_id"], r["bid_amount"], r["bid_rate"],
                  r.get("predicted_amount"), r.get("predicted_rate"),
-                 r.get("note", ""), simulation_id, r.get("customer_idx", 0))
+                 r.get("note", ""), simulation_id, r.get("customer_idx", 0),
+                 int(r.get("n_customers", 0) or 0))
                 for r in rows
             ],
         )
     return len(rows)
+
+
+def load_strategy_table_for_scope(
+    conn: sqlite3.Connection,
+    category: str,
+    contract_method: str,
+    *,
+    agency_name: str = "",
+    region: str = "",
+) -> dict[int, list[float]]:
+    """Return {n_customers: quantiles_list} for a scope's strategy_tables rows.
+
+    Empty agency/region scopes are the cat/method baseline populated by
+    build_strategy_tables_v2. Callers can pass specific agency/region to look
+    up tighter scopes (not yet populated as of 2026-04-20).
+    """
+    rows = conn.execute(
+        """
+        SELECT n_customers, quantiles_json
+        FROM strategy_tables
+        WHERE category = ? AND contract_method = ?
+          AND agency_name = ? AND region = ?
+        ORDER BY n_customers
+        """,
+        (category, contract_method, agency_name, region),
+    ).fetchall()
+    out: dict[int, list[float]] = {}
+    for row in rows:
+        try:
+            qs = json.loads(row["quantiles_json"])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(qs, list) and qs:
+            out[int(row["n_customers"])] = [float(q) for q in qs]
+    return out
 
 
 def replace_auto_mock_bid_batch(
@@ -1708,6 +1745,8 @@ def replace_auto_mock_bid_batch(
 
     Rows are considered auto-generated when note starts with ``auto:``.
     Awarded notices are preserved so historical evaluation remains available.
+    Optional row key ``n_customers`` tags the portfolio size for per-N
+    aggregation (MODES.md §2-표기).
     """
     if not rows:
         return 0
@@ -1734,13 +1773,14 @@ def replace_auto_mock_bid_batch(
             """
             INSERT INTO mock_bids (notice_id, bid_amount, bid_rate,
                 predicted_amount, predicted_rate, note, simulation_id,
-                customer_idx, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                customer_idx, n_customers, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             [
                 (r["notice_id"], r["bid_amount"], r["bid_rate"],
                  r.get("predicted_amount"), r.get("predicted_rate"),
-                 r.get("note", ""), simulation_id, r.get("customer_idx", 0))
+                 r.get("note", ""), simulation_id, r.get("customer_idx", 0),
+                 int(r.get("n_customers", 0) or 0))
                 for r in rows
             ],
         )

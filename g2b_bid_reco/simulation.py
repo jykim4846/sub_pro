@@ -209,6 +209,22 @@ def _quantile_plan(n_customers: int, uncertainty: float) -> list[tuple[str, floa
     return plan
 
 
+def _plan_from_override(quantiles: list[float]) -> list[tuple[str, float]]:
+    # Role labels mirror _quantile_plan so downstream (dashboard, evaluations)
+    # stays consistent regardless of source.
+    qs = sorted(round(float(q), 4) for q in quantiles)
+    if not qs:
+        return []
+    if len(qs) == 1:
+        return [("core", qs[0])]
+    if len(qs) == 2:
+        return [("attack", qs[0]), ("explore", qs[1])]
+    plan: list[tuple[str, float]] = [("attack", qs[0])]
+    plan.extend(("core", q) for q in qs[1:-1])
+    plan.append(("explore", qs[-1]))
+    return plan
+
+
 def generate_customer_bids(
     predicted_rate: float,
     lower_rate: float,
@@ -218,6 +234,7 @@ def generate_customer_bids(
     n_customers: int,
     historical_cases: list[HistoricalBidCase],
     historical_rates_opened_asc: list[float] | None = None,
+    override_quantiles: list[float] | None = None,
 ) -> tuple[list[CustomerBid], float | None, float | None, float, list[float]]:
     market_rates, market_center, market_spread, market_drift = _trend_adjusted_market_rates(
         historical_cases, floor_rate, historical_rates_opened_asc
@@ -233,9 +250,14 @@ def generate_customer_bids(
     upper_guard = max(predicted_rate + 0.08, upper_rate + 0.03)
     floor_guard = (floor_rate + 0.005) if floor_rate is not None and floor_rate > 0 else 0.0
 
+    if override_quantiles is not None:
+        plan = _plan_from_override(override_quantiles)
+    else:
+        plan = _quantile_plan(n_customers, uncertainty)
+
     bids: list[CustomerBid] = []
     previous_rate = floor_guard - 0.005
-    for idx, (role, target_q) in enumerate(_quantile_plan(n_customers, uncertainty), start=1):
+    for idx, (role, target_q) in enumerate(plan, start=1):
         anchor = _quantile(market_rates, target_q)
         rate = _clip(min(anchor - epsilon, upper_guard), floor_rate)
         if rate <= previous_rate:
@@ -266,6 +288,7 @@ def run_simulation(
     historical_cases: list[HistoricalBidCase],
     n_customers: int,
     historical_rates_opened_asc: list[float] | None = None,
+    override_quantiles: list[float] | None = None,
 ) -> SimulationReport:
     customers, market_center, market_spread, uncertainty, market_rates = generate_customer_bids(
         predicted_rate=predicted_rate,
@@ -276,6 +299,7 @@ def run_simulation(
         n_customers=n_customers,
         historical_cases=historical_cases,
         historical_rates_opened_asc=historical_rates_opened_asc,
+        override_quantiles=override_quantiles,
     )
     if not customers or base_amount <= 0:
         return SimulationReport(

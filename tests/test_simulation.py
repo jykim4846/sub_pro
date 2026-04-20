@@ -19,6 +19,7 @@ from g2b_bid_reco.db import (
     list_mock_bids,
     get_agency_parent_pool,
     load_cases_with_shrinkage,
+    load_strategy_table_for_scope,
     refresh_mock_bid_evaluations,
     replace_auto_mock_bid_batch,
     seed_agency_parent_mapping,
@@ -29,7 +30,7 @@ from g2b_bid_reco.db import (
     update_automation_run,
 )
 from g2b_bid_reco.models import BidNoticeSnapshot, HistoricalBidCase
-from g2b_bid_reco.simulation import run_simulation
+from g2b_bid_reco.simulation import generate_customer_bids, run_simulation
 
 
 class SimulationStrategyTest(unittest.TestCase):
@@ -890,6 +891,144 @@ class SimulationStrategyTest(unittest.TestCase):
         self.assertEqual(meta["n_parent_anchor"], 10)
         self.assertAlmostEqual(meta["w_sub"], 40 / 50)
         self.assertEqual(len(cases), 50)
+
+
+    def test_load_strategy_table_for_scope_returns_per_n_quantiles(self) -> None:
+        with connect(self.db_path) as conn:
+            for n, qs in [(1, [0.5]), (2, [0.3, 0.7]), (3, [0.2, 0.5, 0.8])]:
+                conn.execute(
+                    """
+                    INSERT INTO strategy_tables
+                        (agency_name, category, contract_method, region,
+                         n_customers, quantiles_json, source,
+                         sample_size, win_rate_estimate)
+                    VALUES (?, ?, ?, ?, ?, ?, 'montecarlo_v2', 100, 0.5)
+                    """,
+                    ("", "service", "전자입찰", "", n, json.dumps(qs)),
+                )
+            # Row for a different scope that must not leak in.
+            conn.execute(
+                """
+                INSERT INTO strategy_tables
+                    (agency_name, category, contract_method, region,
+                     n_customers, quantiles_json, source,
+                     sample_size, win_rate_estimate)
+                VALUES ('', 'goods', '전자입찰', '', 2, ?, 'montecarlo_v2', 100, 0.5)
+                """,
+                (json.dumps([0.1, 0.9]),),
+            )
+        with connect(self.db_path) as conn:
+            out = load_strategy_table_for_scope(conn, "service", "전자입찰")
+        self.assertEqual(sorted(out.keys()), [1, 2, 3])
+        self.assertEqual(out[2], [0.3, 0.7])
+        self.assertEqual(out[3], [0.2, 0.5, 0.8])
+
+    def test_generate_customer_bids_honors_override_quantiles(self) -> None:
+        cases = [
+            HistoricalBidCase(
+                notice_id=f"H-OV-{idx}",
+                agency_name="기관Z",
+                category="service",
+                contract_method="전자입찰",
+                region="seoul",
+                base_amount=100_000_000.0,
+                award_amount=100_000_000.0 * ((85.0 + idx * 0.2) / 100.0),
+                bid_rate=85.0 + idx * 0.2,
+                bidder_count=10,
+                opened_at=f"2025-01-{idx + 1:02d}",
+            )
+            for idx in range(20)
+        ]
+        bids_h, *_ = generate_customer_bids(
+            predicted_rate=88.0, lower_rate=86.0, upper_rate=90.0,
+            floor_rate=None, base_amount=100_000_000.0, n_customers=3,
+            historical_cases=cases,
+        )
+        bids_o, *_ = generate_customer_bids(
+            predicted_rate=88.0, lower_rate=86.0, upper_rate=90.0,
+            floor_rate=None, base_amount=100_000_000.0, n_customers=3,
+            historical_cases=cases,
+            override_quantiles=[0.1, 0.5, 0.9],
+        )
+        self.assertEqual(len(bids_o), 3)
+        # Role labelling mirrors _quantile_plan so downstream stays consistent.
+        self.assertEqual([b.role for b in bids_o], ["attack", "core", "explore"])
+        self.assertEqual([b.target_quantile for b in bids_o], [0.1, 0.5, 0.9])
+        # Override should yield a wider spread than the default heuristic (0.18 / 0.78).
+        o_spread = bids_o[-1].rate - bids_o[0].rate
+        h_spread = bids_h[-1].rate - bids_h[0].rate
+        self.assertGreater(o_spread, h_spread)
+
+    def test_auto_bid_pending_uses_strategy_tables_multi_n(self) -> None:
+        scope_category = "service"
+        scope_method = "전자입찰"
+        with connect(self.db_path) as conn:
+            for idx in range(12):
+                insert_case(
+                    conn,
+                    HistoricalBidCase(
+                        notice_id=f"HIST-STX-{idx}",
+                        agency_name="기관A",
+                        category=scope_category,
+                        contract_method=scope_method,
+                        region="seoul",
+                        base_amount=100_000_000.0,
+                        award_amount=88_000_000.0 + idx,
+                        bid_rate=88.0 + (idx * 0.01),
+                        bidder_count=10,
+                        opened_at=f"2025-01-{idx + 1:02d}",
+                    ),
+                )
+            insert_case(
+                conn,
+                HistoricalBidCase(
+                    notice_id="PENDING-STX-1",
+                    agency_name="기관A",
+                    category=scope_category,
+                    contract_method=scope_method,
+                    region="seoul",
+                    base_amount=100_000_000.0,
+                    award_amount=0.0,
+                    bid_rate=0.0,
+                    bidder_count=0,
+                    opened_at="2025-02-01",
+                ),
+            )
+            for n, qs in [(1, [0.5]), (2, [0.3, 0.7]), (3, [0.2, 0.5, 0.8])]:
+                conn.execute(
+                    """
+                    INSERT INTO strategy_tables
+                        (agency_name, category, contract_method, region,
+                         n_customers, quantiles_json, source,
+                         sample_size, win_rate_estimate)
+                    VALUES ('', ?, ?, '', ?, ?, 'montecarlo_v2', 100, 0.5)
+                    """,
+                    (scope_category, scope_method, n, json.dumps(qs)),
+                )
+
+        _auto_bid_pending(
+            Namespace(
+                db_path=str(self.db_path),
+                category=None,
+                agency=None,
+                since_days=None,
+                limit=10,
+                top_k=5,
+                num_customers=3,  # ignored when strategy_tables populated
+                target_win_probability=0.75,
+                dry_run=False,
+            )
+        )
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT note, n_customers FROM mock_bids WHERE notice_id = ?",
+                ("PENDING-STX-1",),
+            ).fetchall()
+        # 1 + 2 + 3 = 6 bids across N=1,2,3 portfolios.
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(str(r["note"]).startswith("auto:strategy_v2") for r in rows))
+        ns = sorted(int(r["n_customers"]) for r in rows)
+        self.assertEqual(ns, [1, 2, 2, 3, 3, 3])
 
 
 if __name__ == "__main__":

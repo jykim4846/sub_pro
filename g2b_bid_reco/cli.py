@@ -40,6 +40,7 @@ from .db import (
     load_historical_cases,
     load_historical_cases_for_notice,
     load_pending_notices_for_prediction,
+    load_strategy_table_for_scope,
     replace_auto_mock_bid_batch,
     refresh_mock_bid_evaluations,
     resolve_adaptive_agencies,
@@ -740,9 +741,9 @@ def _auto_bid_scope_worker(payload: dict) -> dict:
     ]
     timings["preload_s"] = perf_counter() - preload_started
 
-    # Approved parent-agency index, used to narrow peer cases to the sibling
-    # group so shrinkage pulls toward the parent-agency trend instead of the
-    # category-wide mean.
+    # Approved parent-agency index + strategy_tables (per-N quantiles) loaded
+    # once per scope. Parent pool narrows shrinkage peers to siblings;
+    # strategy rows drive portfolio quantile selection (MODES.md §5-step2).
     agency_to_parent: dict[str, str] = {}
     parent_to_children: dict[str, set[str]] = {}
     with connect(db_path) as _map_conn:
@@ -754,6 +755,16 @@ def _auto_bid_scope_worker(payload: dict) -> dict:
             parent_to_children.setdefault(row["parent_name"], set()).add(
                 row["agency_name"]
             )
+        strategy_rows = load_strategy_table_for_scope(_map_conn, cat, method)
+    if strategy_rows:
+        n_values = sorted(strategy_rows.keys())
+        source_tag = "strategy_v2"
+    else:
+        n_values = [num_customers]
+        # Preserve the legacy note prefix so existing consumers/tests that key
+        # off "auto:trend-aware-quantile" keep working when no strategy table
+        # is available for this scope.
+        source_tag = "trend-aware-quantile"
 
     group = sorted(group, key=lambda item: ((item.opened_at or ""), item.notice_id))
     prior_cases: list = []
@@ -799,48 +810,55 @@ def _auto_bid_scope_worker(payload: dict) -> dict:
             timings["predict_s"] += perf_counter() - predict_started
 
             simulate_started = perf_counter()
-            report = run_simulation(
-                notice_id=notice.notice_id,
-                base_amount=notice.base_amount,
-                floor_rate=notice.floor_rate,
-                predicted_rate=analysis.blended_rate,
-                lower_rate=analysis.lower_rate,
-                upper_rate=analysis.upper_rate,
-                predicted_amount=analysis.recommended_amount,
-                competitors=comps_cached,
-                historical_cases=cases,
-                n_customers=num_customers,
-                historical_rates_opened_asc=prior_valid_rates_opened_asc,
-            )
-            timings["simulate_s"] += perf_counter() - simulate_started
-            out_reports.append(
-                {
-                    "notice_id": notice.notice_id,
-                    "agency_name": notice.agency_name,
-                    "portfolio_win_rate": round(report.our_win_rate, 4),
-                    "best_customer_idx": report.best_customer_idx,
-                    "market_drift": report.market_drift,
-                    "uncertainty_score": report.uncertainty_score,
-                    "parent_used": parent_name or "",
-                }
-            )
-            for customer in report.customers:
-                out_batch.append(
+            for n in n_values:
+                override_q = strategy_rows.get(n) if strategy_rows else None
+                report = run_simulation(
+                    notice_id=notice.notice_id,
+                    base_amount=notice.base_amount,
+                    floor_rate=notice.floor_rate,
+                    predicted_rate=analysis.blended_rate,
+                    lower_rate=analysis.lower_rate,
+                    upper_rate=analysis.upper_rate,
+                    predicted_amount=analysis.recommended_amount,
+                    competitors=comps_cached,
+                    historical_cases=cases,
+                    n_customers=n,
+                    historical_rates_opened_asc=prior_valid_rates_opened_asc,
+                    override_quantiles=override_q,
+                )
+                out_reports.append(
                     {
                         "notice_id": notice.notice_id,
-                        "bid_amount": customer.amount,
-                        "bid_rate": customer.rate,
-                        "predicted_amount": analysis.recommended_amount,
-                        "predicted_rate": analysis.blended_rate,
-                        "note": (
-                            "auto:trend-aware-quantile"
-                            f";portfolio_win_rate={report.our_win_rate:.3f}"
-                            f";role={customer.role}"
-                            f";uncertainty={report.uncertainty_score:.3f}"
-                        ),
-                        "customer_idx": customer.idx,
+                        "agency_name": notice.agency_name,
+                        "n_customers": n,
+                        "source": source_tag,
+                        "portfolio_win_rate": round(report.our_win_rate, 4),
+                        "best_customer_idx": report.best_customer_idx,
+                        "market_drift": report.market_drift,
+                        "uncertainty_score": report.uncertainty_score,
+                        "parent_used": parent_name or "",
                     }
                 )
+                for customer in report.customers:
+                    out_batch.append(
+                        {
+                            "notice_id": notice.notice_id,
+                            "bid_amount": customer.amount,
+                            "bid_rate": customer.rate,
+                            "predicted_amount": analysis.recommended_amount,
+                            "predicted_rate": analysis.blended_rate,
+                            "note": (
+                                f"auto:{source_tag}"
+                                f";portfolio_win_rate={report.our_win_rate:.3f}"
+                                f";role={customer.role}"
+                                f";uncertainty={report.uncertainty_score:.3f}"
+                                f";n={n}"
+                            ),
+                            "customer_idx": customer.idx,
+                            "n_customers": n,
+                        }
+                    )
+            timings["simulate_s"] += perf_counter() - simulate_started
         except Exception as exc:
             failures += 1
             out_reports.append(
@@ -1095,7 +1113,9 @@ def _auto_bid_pending(args: argparse.Namespace) -> dict:
                 )
         finally:
             if max_workers > 1 and len(tasks) > 1:
-                pool.shutdown(wait=False, cancel_futures=False)
+                # cancel_futures=False is the default; kwarg was Python 3.9+ only
+                # and broke 3.8. as_completed already drained all futures above.
+                pool.shutdown(wait=False)
         for notice in skipped_no_scope:
             processed += 1
             failures += 1
