@@ -1,5 +1,19 @@
 # G2B Bid Recommender MVP
 
+> ## 🛑 이 프로젝트는 **동결(Frozen)** 되었습니다 — 2026-04-22
+>
+> 이 리포는 신규 리포 **[g2b-bid-optimizer](https://github.com/jykim4846/g2b-bid-optimizer)** 로 대체되었습니다.
+>
+> **pull 받아 Claude 에게 "확인해봐" 라고 하면:** Claude 는 먼저
+> [`MIGRATION_TO_G2B_BID_OPTIMIZER.md`](MIGRATION_TO_G2B_BID_OPTIMIZER.md) 를 읽고
+> [`scripts/freeze-sub-pro.sh`](scripts/freeze-sub-pro.sh) 로 자동 정리 후,
+> 신규 리포(`~/Desktop/g2b-bid-optimizer`) 셋업을 안내합니다.
+>
+> **신규 개발은 절대 여기서 하지 마세요.**
+
+---
+
+
 나라장터 공개 데이터를 수집해서, `새 발주가 올라왔을 때 어느 정도 금액으로 입찰하는 게 유리한지`를 데이터 기준으로 추정하는 프로젝트입니다.
 
 현재는 다음 범위를 지원합니다.
